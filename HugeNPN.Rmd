@@ -1,0 +1,263 @@
+---
+title: "Nonparanormal graphical model"
+subtitle: "Selection using StARS"
+author: "Mathias Cardner"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(igraph)
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+library(huge)
+```
+
+```{r}
+dictionary <- readRDS("computations/dictionary.rds")
+clinical.completed <- readRDS("computations/clinical.completed.rds") %>%
+  mutate(key = sub(" IFCC", "", key))
+functional.normalised <- readRDS("computations/functional.normalised.fin.rds") %>%
+  mutate(key = gsub("respiration", "resp", key))
+lipidomics.normalised <- readRDS("computations/lipidomics.normalised.fin.rds")
+proteomics.normalised <- readRDS("computations/proteomics.normalised.fin.rds")
+nightingale.normalised <- readRDS("computations/nightingale.normalised.fin.rds") %>%
+  mutate(key = ifelse(key == "HDL-C", "HDL-C (NMR)", key))
+```
+
+```{r}
+categoricals <- c("Diabetes", "CHD", "Daily alcohol consumption",
+                  "Female", "Hypertension", "Kidney disease", "Smoker")
+# categoricals %in% clinical.completed$key %>% all()
+clinical.continuous <- clinical.completed %>%
+  filter(!key %in% categoricals) %>%
+  mutate(value = log(value))
+```
+
+```{r eval=FALSE, include=FALSE}
+bind_rows(clinical.continuous,
+          functional.normalised,
+          lipidomics.normalised,
+          proteomics.normalised,
+          nightingale.normalised) %>%
+  filter(str_detect(`Proband ID`, "^HDLX-")) %>%
+  # filter(`data source` %in% c("functional", "clinical")) %>%
+  group_by(key) %>%
+  mutate(scaled = scale(value)) %>%
+  ungroup() %>%
+  ggplot(aes(sample = scaled, colour = `data source`)) +
+  theme_bw() +
+  labs(title = "Normal Q–Q plots",
+       subtitle =
+         paste("Numerical clinical data and normalised functional data")) +
+  geom_qq(show.legend = F) +
+  geom_qq_line(show.legend = F) +
+  facet_wrap(~ `data source`)
+ggsave("plots/QQ_clinical_functional_normalised.png",
+       width = 4, height = 3, device = "png")
+```
+
+```{r}
+Data <- bind_rows(clinical.continuous,
+                  functional.normalised,
+                  lipidomics.normalised,
+                  proteomics.normalised,
+                  nightingale.normalised) %>%
+  filter(str_detect(`Proband ID`, "^HDLX-")) %>%
+  dplyr::select(`Proband ID`, key, value) %>%
+  spread(key, value) %>%
+  filter(rowSums(is.na(.)) == 0) %>%
+  column_to_rownames("Proband ID") %>%
+  as.matrix()
+```
+
+```{r eval=FALSE, include=FALSE}
+npn.skeptic <- huge.npn(Data, npn.func = "skeptic")
+pc.fit <- pc(suffStat = list(C = npn.skeptic, n = nrow(Data)),
+             indepTest = gaussCItest, ## indep.test: partial correlations
+             alpha=0.01, labels = colnames(Data), verbose = TRUE)
+plot(pc.fit)
+```
+
+```{r}
+# Perform nonparanormal transforms: "shrinkage" is per-column qnorm(rank/(n+1)).
+npn.shrink <- huge.npn(Data, npn.func = "shrinkage")
+# Compute graphical lasso regularisation path.
+set.seed(42)
+huge.out <- huge(npn.shrink, method = "glasso")
+# Perform StARS to tune the regularisation parameter.
+set.seed(42)
+npn.select <- huge.select(huge.out, criterion = "stars", stars.thresh = 0.075)
+saveRDS(npn.select, "computations/npn_select_stars_0.075_seed42_fin.rds")
+# npn.select <- readRDS("computations/npn_select_stars_0.075_seed42_fin.rds")
+
+clinical <- clinical.continuous %>% pull(key) %>% unique()
+bioassays <- functional.normalised %>% pull(key) %>% unique()
+proteins <- proteomics.normalised %>% pull(key) %>% unique()
+lipids <- lipidomics.normalised %>% pull(key) %>% unique()
+nights <- nightingale.normalised %>% pull(key) %>% unique()
+
+nodeNames <- colnames(Data)
+nodeColours <- rep("red", length(nodeNames))
+colourz <- brewer.pal(n = 5, name = "Pastel1")[c(3,2,5,1,4)]
+dataTypes <- c("clinical", "functional", "lipidomics", "proteomics",
+               "NMR spectroscopy")
+names(colourz) <- dataTypes
+nodeColours[nodeNames %in% clinical] <- colourz[1]
+nodeColours[nodeNames %in% bioassays] <- colourz[2]
+nodeColours[nodeNames %in% lipids] <- colourz[3]
+nodeColours[nodeNames %in% proteins] <- colourz[4]
+nodeColours[nodeNames %in% nights] <- colourz[5]
+names(nodeColours) <- nodeNames
+
+# Extract precision matrix and compute partial correlations.
+K <- npn.select$opt.icov %>% as.matrix()
+adja <- -K / sqrt(diag(K) %*% t(diag(K)))
+rownames(adja) <- colnames(adja) <- nodeNames
+graf <- graph_from_adjacency_matrix(adja, mode = "undirected",
+                                    diag = FALSE, weighted = "char")
+```
+
+## Bipartite subgraph involving HDL function and the rest
+
+```{r}
+links <- which(colSums(adja[bioassays,]) != 0) %>% names() %>% setdiff(bioassays)
+subgraph <- adja[bioassays, links]
+delgraf <- graph_from_incidence_matrix(subgraph, directed = FALSE,
+                                       weighted = "partialCorrelation")
+colpal <- c(colorRampPalette(rev(brewer.pal(9, "Blues")))(500),
+            "#FFFFFF",
+            colorRampPalette(brewer.pal(9, "Reds"))(500))
+
+coloriser <- function(parcors) {
+  neg_idx <- which(parcors < 0)
+  neg_intensity <- round(500 * parcors[neg_idx] / min(parcors))
+  negcols <- colorRampPalette(brewer.pal(9, "Blues"))(500)[neg_intensity]
+  pos_idx <- which(parcors > 0)
+  pos_intensity <- round(500 * parcors[pos_idx] / max(parcors))
+  poscols <- colorRampPalette(brewer.pal(9, "Reds"))(500)[pos_intensity]
+  palett <- character(length(parcors))
+  palett[neg_idx] <- negcols
+  palett[pos_idx] <- poscols
+  return(palett)
+}
+
+E(delgraf)$color <- coloriser(edge.attributes(delgraf)$partialCorrelation)
+
+pdf("plots/Figure 4 GGM hospital+gender adjusted.pdf",
+    width = 8.27, height = 8.27)
+par(mar = c(0, 0, 0, 0) + 0.1)
+set.seed(1)
+plot(delgraf, vertex.color = nodeColours[V(delgraf) %>% names()],
+     vertex.size = c(rep(10, nrow(subgraph)), rep(7, ncol(subgraph))),
+     vertex.label.family = "sans", vertex.label.cex = 0.5,
+     vertex.frame.color = "darkgrey")
+usr <- par("usr")
+width <- (usr[2L] - usr[1L]) * .2
+height <- (usr[4L] - usr[3L]) * .05
+ranger <- range(edge.attributes(delgraf)$partialCorrelation)
+plotrix::color.legend(usr[1] + 0.1, usr[3] + 0.1, usr[1] + width,
+                      usr[3] + 0.1 + height, # xLeft, yBottom, xRight, yTop
+                      signif(c(ranger[1], 0, ranger[2]), digits = 1),
+                      rect.col = colpal, align = "rb", gradient = "x", cex = 1)
+text(x = usr[1] + 0.05 + width/2, y = usr[3] + 0.075 + 2 * height,
+     labels = "shrunken\npartial correlation", cex = 1)
+legend(x = "topleft", legend = dataTypes, pch = 21, pt.bg = colourz[dataTypes],
+       title = "data source", bty = "n")
+dev.off()
+```
+
+### Heatmap
+
+```{r}
+# Keep only bioassays with at least one edge.
+subgraph.hm <- subgraph[!apply(subgraph == 0, 1, all),]
+extremeValue <- range(subgraph.hm) %>% abs() %>% max() %>% signif(2)
+legendPalette <- colorRampPalette(rev(brewer.pal(n = 11, name = "RdYlBu")))(100)
+legendPalette[50] <- "white"
+legendBreaks <- seq(-extremeValue, extremeValue, length.out = 101)
+
+feature.annotation <- bind_rows(clinical.completed,
+                                functional.normalised,
+                                lipidomics.normalised,
+                                proteomics.normalised,
+                                nightingale.normalised) %>%
+  select(key, `data source`) %>%
+  distinct() %>%
+  filter(key %in% colnames(subgraph.hm)) %>%
+  column_to_rownames("key")
+
+pdf("plots/Suppl_Fig_6_GGM_function_bipartite_heatmap.pdf",
+    width = 8.27, height = 8.27/3)
+pheatmap(subgraph.hm,
+         color = legendPalette,
+         fontsize = 10,
+         fontsize_row = 8,
+         fontsize_col = 6,
+         border_color = "white",
+         legend_breaks = signif(extremeValue * c(-1, -.5, 0, .5, 1), 1),
+         # annotation_col = feature.annotation,
+         # annotation_colors = list(`data source` = c(clinical = colourz[[1]],
+         #                                            functional = colourz[[2]],
+         #                                            lipidomics = colourz[[3]],
+         #                                            proteomics = colourz[[4]],
+         #                                            "lipoprotein profiling" =
+         #                                              colourz[[5]])),
+         breaks = legendBreaks,
+         cluster_rows = F, cluster_cols = F)
+dev.off()
+```
+
+#### ggplot2
+
+```{r}
+subgraph.hm %>%
+  as.data.frame() %>%
+  rownames_to_column("assay") %>%
+  gather(feature, value, -assay) %>%
+  filter(value != 0) %>%
+  mutate(edgecol = coloriser(value),
+         feature = factor(feature, levels = rev(unique(feature))),
+         extreme = value < quantile(value, probs = .1) |
+           value > quantile(value, probs = .9)) %>%
+  ggplot(aes(assay, feature, fill = edgecol, colour = extreme, label = value)) +
+  theme_classic() +
+  geom_tile(colour = "white") +
+  scale_fill_identity() +
+  scale_color_manual(guide = FALSE, values = c("black", "white")) +
+  geom_text(aes(label = signif(value, 1)), size = 1.5, show.legend = FALSE) +
+  theme(axis.text.x = element_text(angle = 315, hjust = 0, vjust = 0.5),
+        axis.text.y = element_text(size = rel(0.6)))
+ggsave("plots/Suppl_Fig_S6_GGM.pdf", width = 6, height = 9)
+```
+
+#### xtable with column headers grouped by assay principle
+
+```{r eval=FALSE, include=FALSE}
+library(xtable)
+options(xtable.comment = FALSE, xtable.booktabs = TRUE)
+source("print_2heading_xtable.R") # from github.com/HughParsonage/grattanCharts
+subgraph.hm %>%
+  as.data.frame() %>%
+  rownames_to_column("assay") %>%
+  mutate(assay = sub(" ", "__", assay),
+         assay = ifelse(str_detect(assay, "-MMP__C2C12"),
+                        paste0("MMP C2C12__",
+                               sub("-MMP__C2C12", "", assay)), assay)) %>%
+  gather(feature, value, -assay) %>%
+  filter(value != 0) %>%
+  spread(assay, value) %>%
+  print_2heading_xtable(separator = "__", display = c("s", rep("g", 10)),
+                        math.style.exponents = TRUE, math.style.negative = TRUE)
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

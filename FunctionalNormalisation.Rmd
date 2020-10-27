@@ -1,0 +1,210 @@
+---
+title: "Functional bioassays: normalisation"
+subtitle: "Random effects modelling to remove batch and plate effects"
+author: "Mathias Cardner"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(lme4)
+dictionary <- readRDS("computations/dictionary.rds")
+covariates <- readRDS("computations/covariates.rds")
+functional.tidy <- readRDS("computations/functional.tidy.rds")
+```
+
+# Random effects models for removing batch and plate effects
+
+Replicates are spread across plates. Since plate effects are strong, we cannot simply average replicates. Also, in round 1, not all plates have measurements of rHDL or PBS. Thus, we cannot normalise measurements in a naive way.
+
+## MMP motivation
+
+The experimental design changed between rounds. In round 1, replicates are spread across two plates, though each sample belongs to precisely one batch. In round 2, all replicates of a given sample are on the same plate.
+
+## Functions
+
+We use \texttt{lme4} to fit a random effects model with random intercepts for each \texttt{HDL No}. The following function extracts the estimated intercept (mean effect) of each sample \texttt{HDL No}, and returns a tidy tibble.
+
+```{r}
+lmer_extract_ranefs <- function(lmerObject) {
+  ranef(lmerObject)[["HDL No"]] %>%
+    rownames_to_column("HDL No") %>%
+    as_tibble() %>%
+    rename(random.effect = `(Intercept)`)
+}
+
+lmer_extract_coefs <- function(lmerObject) {
+  coef(lmerObject)[["HDL No"]] %>%
+    rownames_to_column("HDL No") %>%
+    as_tibble()
+}
+
+func.dict <- tibble(key = c("HAEC CDDElisa", "INS1E CDDElisa",
+                            "Efflux EDTA Plasma", "Efflux HDL", "Baseline",
+                            "Oligomycin", "cAMP", "FCCP", "10min HDL",
+                            "1hr HDL", "2hr HDL", "10min CCCP"),
+                    new = c("apoptosis HAEC", "apoptosis INS1e",
+                            "CEC apoB-free plasma", "CEC HDL",
+                            "respiration basal", "respiration uncoupled",
+                            "respiration cAMP", "respiration max",
+                            "10min-MMP C2C12", "1hr-MMP C2C12",
+                            "2hr-MMP C2C12", "10min CCCP-MMP C2C12"))
+```
+
+## Assays where plate is batch
+
+```{r}
+functional.tidy %>%
+  filter(is.na(batch), is.na(measurement)) %>%
+  mutate(plate = factor(plate, levels = unique(plate))) %>%
+  ggplot(aes(plate, value, colour = type)) +
+  theme_bw() +
+  geom_boxplot(notch = T, varwidth = T) +
+  facet_wrap(~ key, scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+There appear to be plate effects on rHDL and VEGF.
+
+```{r}
+normalise <- function(dF) {
+  # `measurement' is NA iff the observation comes from the respiration assays.
+  if(all(is.na(dF$measurement))) {
+    lmer(value ~ plate + Diabetes + CHD + hospital + Female + rotor +
+           `Start isolation` + (1 | `HDL No`), data = dF)
+  } else {
+    lmer(value ~ plate + measurement + Diabetes + CHD + hospital + Female +
+           rotor + `Start isolation` + (1 | `HDL No`),
+         data = dF %>%
+           filter(!exclude,
+                  # Exclude Measurements 7 and 8, which according to Miro
+                  # are too early to show cAMP response
+                  !measurement %in% paste("Measurement", 7:8)))
+  }
+}
+
+pre.norm <- functional.tidy %>%
+  select(-round) %>%
+  left_join(covariates, by = "HDL No") %>%
+  # filter(str_detect(`Proband ID`, "^HDLX-")) %>%
+  group_by(key) %>%
+  nest() %>%
+  mutate(lmers = map(data, normalise)) %>%
+  mutate(ranefs = map(lmers, lmer_extract_ranefs)) %>%
+  mutate(coefs = map(lmers, lmer_extract_coefs),
+         augs = pmap(.l = list(ranefs, coefs), .f = function(x, y) {
+           left_join(x, y, by = "HDL No")}))
+
+post.norm <- pre.norm %>%
+  unnest(augs) %>%
+  group_by(`HDL No`) %>%
+  # Subtract `Rotenone/Antimycine` response from respiration assays.
+  mutate(`(Intercept)` = ifelse(
+    key %in% c("Baseline", "Oligomycin", "cAMP", "FCCP"),
+    `(Intercept)` - random.effect[key == "Rotenone/Antimycine"], `(Intercept)`)) %>%
+  ungroup() %>%
+  filter(key != "Rotenone/Antimycine")
+
+func.norm <- post.norm %>%
+  left_join(covariates, by = "HDL No") %>%
+  # `(Intercept)` is in fact random effect + fixed intercept; see ?coef.merMod.
+  mutate(value = `(Intercept)` + Diabetes * DiabetesTRUE + CHD * CHDTRUE) %>%
+  select(key, `HDL No`, value, `Proband ID`) %>%
+  # Declare data source
+  mutate(`data source` = "functional")  %>%
+  # Translate assay names
+  left_join(func.dict, by = "key") %>%
+  select(-key) %>%
+  rename(key = new)
+
+saveRDS(func.norm, "computations/functional.normalised.fin.rds")
+```
+
+### Seahorse plots
+
+#### Boxplot
+
+```{r}
+functional.tidy %>%
+  filter(is.na(batch), !is.na(measurement), !is.na(`HDL No`), !exclude) %>%
+  mutate(plate = factor(plate, levels = unique(plate)),
+         time = factor(measurement, levels = unique(measurement)),
+         type = ifelse(`HDL No` == "PBS", "PBS", "HDL")) %>%
+  filter(type == "HDL") %>%
+  ggplot(aes(plate, value, colour = time)) +
+  labs(title = "Seahorse data") +
+  theme_bw() +
+  geom_boxplot() +
+  facet_grid(key ~ ., scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("plots/Seahorse_boxplot.pdf")
+```
+
+#### Line plot
+
+```{r}
+functional.tidy %>%
+  filter(is.na(batch), !is.na(measurement), !is.na(`HDL No`)) %>%
+  mutate(plate = factor(plate, levels = unique(plate)),
+         timepoint = factor(measurement, levels = unique(measurement)),
+         type = ifelse(`HDL No` == "PBS", "PBS", "HDL")) %>%
+  group_by(key, plate, measurement, `HDL No`) %>%
+  summarise(value = median(value)) %>%
+  ungroup() %>%
+  # filter(`HDL No` == "HDL_1") %>%
+  ggplot(aes(parse_number(measurement), value, colour = key)) +
+  theme_bw() +
+  geom_line(aes(group = `HDL No`)) +
+  labs(title = "Seahorse data",
+       subtitle = "Each line refers to one HDL sample's median across technical replicates",
+       x = "time (measurement)") +
+  # geom_jitter(height = 0) +
+  # geom_boxplot(notch = T, varwidth = T) +
+  # facet_grid(key ~ ., scales = "free") +
+  # facet_wrap(~ key, nrow = 1, scales = "free_x") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("plots/Seahorse_lineplot.pdf")
+```
+
+The plate effects need to be modelled (especially in FCCP). Clearly influential is the *Measurement*. In Miro's assays, "Measurement" does *not* denote replicate, but rather sampling time.
+
+As per Miro's email on 22.3.2018, nonmitochondrial respiration (Rotenone/Antimycine) should be subtracted from all values. Also rename the various keys according to that email.
+
+## Assays with several plates per batch
+
+There are clearly batch effects, and there appear to be plate effects too. However, the plates alias the batches, so there is no point in estimating effects for the batches. It potentially makes the model unidentifiable, and if not, it gives us more parameters to estimate.
+
+### Mitochondrial membrane potential
+
+Are there systematic differences between batches?
+
+```{r}
+Edlira.assays <- functional.tidy %>%
+  filter(!is.na(batch)) %>%
+  pull(key) %>% unique() %>% as.list()
+names(Edlira.assays) <- Edlira.assays
+
+functional.tidy %>%
+  filter(key %in% Edlira.assays[-1]) %>%
+  ggplot(aes(key, value, colour = plate)) +
+  theme_bw() +
+  labs(title = "MMP assays",
+       x = "") +
+  geom_jitter(width = .4, height = 0) +
+  facet_grid(type ~ batch, scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Yes, there are batch effects, and there also appears to be plate effects.
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

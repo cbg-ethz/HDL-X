@@ -1,0 +1,308 @@
+---
+title: "Joint GGM"
+author: "Mathias Cardner"
+date: "16/07/2018"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+library(huge)
+```
+
+```{r}
+dictionary <- readRDS("computations/dictionary.rds")
+clinical.completed <- readRDS("computations/clinical.completed.rds") %>%
+  mutate(key = sub(" IFCC", "", key))
+functional.normalised <- readRDS("computations/functional.normalised.rds") %>%
+  mutate(key = gsub("respiration", "resp", key))
+lipidomics.normalised <- readRDS("computations/lipidomics.normalised.rds")
+proteomics.normalised <- readRDS("computations/proteomics.normalised.rds")
+nightingale.normalised <- readRDS("computations/nightingale.normalised.rds")
+```
+
+```{r}
+categoricals <- c("Diabetes", "CHD", "Daily alcohol consumption",
+                  "Female", "Hypertension", "Kidney disease", "Smoker")
+# categoricals %in% clinical.completed$key %>% all()
+clinical.continuous <- clinical.completed %>%
+  filter(!key %in% categoricals) %>%
+  mutate(value = log(value))
+```
+
+```{r eval=FALSE, include=FALSE}
+bind_rows(clinical.continuous,
+          functional.normalised,
+          lipidomics.normalised,
+          proteomics.normalised,
+          nightingale.normalised) %>%
+  filter(str_detect(`Proband ID`, "^HDLX-")) %>%
+  # filter(`data source` %in% c("functional", "clinical")) %>%
+  group_by(key) %>%
+  mutate(scaled = scale(value)) %>%
+  ungroup() %>%
+  ggplot(aes(sample = scaled, colour = `data source`)) +
+  theme_bw() +
+  labs(title = "Normal Q–Q plots",
+       subtitle =
+         paste("Numerical clinical data and normalised functional data")) +
+  geom_qq(show.legend = F) +
+  geom_qq_line(show.legend = F) +
+  facet_wrap(~ `data source`)
+ggsave("plots/QQ_clinical_functional_normalised.png",
+       width = 4, height = 3, device = "png")
+```
+
+# Four classes: full contingency table
+
+```{r}
+Data <- bind_rows(clinical.continuous,
+                  functional.normalised,
+                  lipidomics.normalised,
+                  proteomics.normalised,
+                  nightingale.normalised) %>%
+  filter(str_detect(`Proband ID`, "^HDLX-")) %>%
+  dplyr::select(`Proband ID`, key, value) %>%
+  spread(key, value) %>%
+  filter(rowSums(is.na(.)) == 0) %>%
+  column_to_rownames("Proband ID") %>%
+  as.matrix()
+anyNA(Data)
+range(Data)
+hist(Data, breaks = 100)
+```
+
+```{r}
+healthy <- dictionary %>%
+  filter(Diabetes == FALSE, CHD == FALSE) %>%
+  pull(`Proband ID`) %>%
+  intersect(rownames(Data))
+
+diabetes <- dictionary %>%
+  filter(Diabetes == TRUE, CHD == FALSE) %>%
+  pull(`Proband ID`) %>%
+  intersect(rownames(Data))
+
+CHD <- dictionary %>%
+  filter(Diabetes == FALSE, CHD == TRUE) %>%
+  pull(`Proband ID`) %>%
+  intersect(rownames(Data))
+
+both <- dictionary %>%
+  filter(Diabetes == TRUE, CHD == TRUE) %>%
+  pull(`Proband ID`) %>%
+  intersect(rownames(Data))
+
+# Do we also want to scale? Well, why not?
+Datas <- list(healthy = Data[healthy,] %>% scale(),
+              diabetes = Data[diabetes,] %>% scale(),
+              CHD = Data[CHD,] %>% scale(),
+              both = Data[both,] %>% scale())
+# saveRDS(Datas, "computations/Datas_4classes.rds")
+```
+
+# Two classes: patients and healthy volunteers
+
+```{r}
+diseased <- dictionary %>%
+  filter(Diabetes == TRUE | CHD == TRUE) %>%
+  pull(`Proband ID`) %>%
+  intersect(rownames(Data))
+
+# Do we also want to scale? Well, why not?
+Datas <- list(healthy = Data[healthy,] %>% scale(),
+              diseased = Data[diseased,] %>% scale())
+# saveRDS(Datas, "computations/Datas_2classes.rds")
+```
+
+```{r}
+# library(simule)
+# wha <- simule(Datas, lambda = 0.1, epsilon = 0.45, covType = "kendall", parallel = TRUE)
+simres2 <- readRDS("computations/simule_result_2classes.rds")
+label <- colnames(Datas[[1]])
+bioassays <- functional.normalised %>% pull(key) %>% unique()
+bioidx <- sapply(bioassays, function(bioassay) grep(bioassay, label), USE.NAMES = F)
+
+plot(simres2, graphlabel = label, index = bioidx)
+
+
+conn1 <- which(simres2$Graphs[[1]][bioidx,] != 0, arr.ind = T)[,2] %>% unique()
+conn2 <- which(simres2$Graphs[[2]][bioidx,] != 0, arr.ind = T)[,2] %>% unique()
+conn <- union(conn1, conn2) %>% unique() %>% sort()
+simres2sub <- simres2
+simres2sub$Graphs[[1]] <- simres2sub$Graphs[[1]][conn, conn]
+simres2sub$Graphs[[2]] <- simres2sub$Graphs[[2]][conn, conn]
+plot(simres2sub, graphlabel = label[conn])
+```
+
+```{r}
+library(JGL)
+source("KendallJGL.R")
+# environment(KendallJGL) <- as.environment("package:JGL")
+environment(KendallJGL) <- asNamespace("JGL")
+```
+
+```{r}
+tic()
+test <- KendallJGL(Y = Datas, penalty = "fused", lambda1 = 0.25, lambda2 = 0.1,
+            weights = "sample.size")
+toc()
+group_.13_.1 <- JGL(Y = Datas, penalty = "group", lambda1 = .13, lambda2 = .1,
+            weights = "sample.size")
+group_test <- JGL(Y = Datas, penalty = "group", lambda1 = .13, lambda2 = .1,
+            weights = "sample.size", return.whole.theta = TRUE)
+
+# saveRDS(test, "computations/JGL_fused_lambda1-0.13_lambda2-0.1_scaledData.rds")
+testOld <- readRDS("computations/JGL_fused_lambda1-0.13_lambda2-0.1_scaledData.rds")
+```
+
+## Local computations
+
+```{r}
+lambda1s <- seq(0.05, 0.2, length.out = 10)
+lambda2s <- seq(0.05, 0.2, length.out = 10)
+
+JGL_sweep <- lapply(lambda1s, function(lamb1) {
+  lapply(lambda2s, function(lamb2) {
+    JGL(Y = Datas, lambda1 = lamb1, lambda2 = lamb2,
+        return.whole.theta = TRUE)
+  })
+})
+# saveRDS(JGL_sweep, "computations/GGL_sweep_lambda1and2_0.05-0.02_by10.rds")
+```
+
+## From Euler
+
+### GGL
+
+```{r}
+lambda1s <- seq(0.01, 0.2, by = 0.01)
+lambda2s <- seq(0.01, 0.2, by = 0.01)
+
+JGL_sweep <- vector("list", length(lambda1s))
+for(i in 1:length(lambda1s)) {
+  for(j in 1:length(lambda2s)) {
+    JGL_sweep[[i]][[j]] <- readRDS(
+      paste0("JGL/GGL_tau_2classes/FGL_", lambda1s[i], "_",
+             lambda2s[j], ".rds"))
+  }
+}
+```
+
+### FGL
+
+```{r}
+lambda1s <- seq(0.025, 0.2, by = 0.025)
+lambda2s <- seq(0.025, 0.2, by = 0.025)
+
+JGL_sweep <- vector("list", length(lambda1s))
+for(i in 1:length(lambda1s)) {
+  for(j in 1:length(lambda2s)) {
+    JGL_sweep[[i]][[j]] <- readRDS(paste0("JGL/FGL_tau_2classes/FGL_",
+                                          lambda1s[i], "_", lambda2s[j],".rds"))
+  }
+}
+```
+
+```{r}
+Datas <- readRDS("computations/Datas_2classes.rds")
+tr <- function(M) {
+  sum(diag(M))
+}
+
+JGL_AIC_term <- function(n, S, Theta) {
+  n * (tr(S %*% Theta) - log(det(Theta))) + 2 * sum(Theta != 0)
+}
+
+toBeAIC <- list(n = lapply(Datas, nrow),
+                S = lapply(Datas, pcaPP::cor.fk),
+                Theta = NULL)
+
+for(i in 1:length(lambda1s)) {
+  for(j in 1:length(lambda2s)) {
+    toBeAIC$Theta <- JGL_sweep[[i]][[j]]$theta
+    JGL_sweep[[i]][[j]]$AIC <- pmap(toBeAIC, JGL_AIC_term) %>% unlist() %>% sum()
+  }
+}
+
+AICs <- matrix(nrow = length(lambda1s), ncol = length(lambda2s))
+for(i in 1:length(lambda1s)) {
+  for(j in 1:length(lambda2s)) {
+    AICs[i,j] <- JGL_sweep[[i]][[j]]$AIC
+  }
+}
+
+pheatmap::pheatmap(log(AICs), cluster_rows = F, cluster_cols = F,
+                   ylab = expression(lambda_1), xlab = expression(lambda_2))
+optimal <- which.min(AICs) %>% arrayInd(.dim = dim(AICs))
+winner <- JGL_sweep[[optimal[1,1]]][[optimal[1,2]]]
+pdf("plots/FGL_winner.pdf")
+plot(winner)
+dev.off()
+net.hubs(winner$theta)
+functional.normalised <- readRDS("computations/functional.normalised.rds")
+bioassays <- functional.normalised %>% pull(key) %>% unique()
+
+connex <- lapply(bioassays, function(bioassay)
+  net.neighbors(winner$theta, bioassay))
+names(connex) <- bioassays
+
+bioassays <- functional.normalised %>%
+  pull(key) %>%
+  unique()
+idx.bioassays <- sapply(bioassays, function(bioassay)
+  grep(bioassay, rownames(winner$theta[[1]])))
+net.neighbors(winner$theta, idx.bioassays[14])
+winner
+```
+
+```{r}
+names(JGL_sweep) <- lambda1s
+GGL_AIC <- lapply(JGL_sweep, function(juggle){
+  names(juggle) <- lambda2s
+  lapply(juggle, function(jug) jug$AIC) %>%
+    bind_rows()
+}) %>%
+  bind_rows(.id = "lambda1") %>%
+  gather(key = "lambda2", value = "AIC", -lambda1) %>%
+  mutate(minimal = ifelse(AIC <= min(AIC), 1, NA))
+bind_rows(`Fused graphical lasso` = FGL_AIC,
+          `Group graphical lasso` = GGL_AIC,
+          .id = "type") %>%
+  ggplot(aes(lambda2, lambda1)) +
+  theme_minimal() +
+  facet_wrap(~ type, scales = "free") +
+  geom_tile(aes(fill = log(AIC)), color = "white") +
+  geom_point(aes(size = minimal)) +
+  #Creating legend
+  # guides(fill = guide_colorbar() +
+  #Creating color range
+  scale_fill_distiller(palette = "RdYlBu") +
+  # guide = "colorbar") +
+  #Rotating labels
+  theme(axis.text.x = element_text(angle = 315, hjust = 0, vjust = 0.5)) +
+  labs(#title = "Group graphical lasso",
+       # subtitle = "AIC for parameter sweep",
+       x = expression(lambda[2]),
+       y = expression(lambda[1]))
+ggsave("plots/JGL_AIC.pdf", width = 8.27, height = 3.1)
+```
+
+## Visualise
+
+```{r}
+adj <- winner$theta[[1]]
+diag(adj) <- 0
+idx0 <- which(apply(adj, 1, function(x) all(x == 0)))
+adj <- adj[-idx0, -idx0]
+1 * (adj != 0) %>%
+  graph_from_adjacency_matrix(mode = "undirected") %>%
+  plot(vertex.size = 1)
+```
+

@@ -1,0 +1,202 @@
+---
+title: "Sparse partial least squares"
+author: "Mathias Cardner"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+library(spls)
+clinical.completed <- readRDS("computations/clinical.completed.rds") %>%
+  # Gender has already been adjusted for during normalisation.
+  filter(key != "Female") %>%
+  mutate(key = ifelse(key == "Diabetes", "T2DM", key))
+functional.normalised <- readRDS("computations/functional.normalised.fin.rds")
+lipidomics.normalised <- readRDS("computations/lipidomics.normalised.fin.rds")
+proteomics.normalised <- readRDS("computations/proteomics.normalised.fin.rds")
+nightingale.normalised <- readRDS("computations/nightingale.normalised.fin.rds") %>%
+  mutate(key = ifelse(key == "HDL-C", "HDL-C (NMR)", key),
+         `data source` = "NMR spec")
+```
+
+```{r}
+# Record names of categorical variables.
+categoricals <- c("T2DM", "CHD", "Daily alcohol consumption",
+                  "Female", "Hypertension", "Kidney disease", "Smoker")
+
+# Build joint data matrix.
+Data <- bind_rows(clinical.completed,
+                  functional.normalised,
+                  lipidomics.normalised,
+                  proteomics.normalised,
+                  nightingale.normalised) %>%
+  # Keep only HDL-X probands.
+  filter(str_detect(`Proband ID`, "^HDLX-")) %>%
+  select(`Proband ID`, key, value) %>%
+  # Standardise continuous variables. Encode binary *responses* as c(-1, 1).
+  group_by(key) %>%
+  mutate(value = ifelse(key %in% categoricals, value, scale(value)),
+         value = ifelse(key %in% c("T2DM", "CHD"), (value-.5)*2, value)) %>%
+  ungroup() %>%
+  spread(key, value) %>%
+  # Omit observations with at least one missing value.
+  filter(rowSums(is.na(.)) == 0) %>%
+  column_to_rownames("Proband ID")
+
+# Record names of functional bioassays.
+bioassays <- functional.normalised %>% pull(key) %>% unique()
+clinics <- clinical.completed %>% pull(key) %>% unique()
+lipids <- lipidomics.normalised %>% pull(key) %>% unique()
+proteins <- proteomics.normalised %>% pull(key) %>% unique()
+nights <- nightingale.normalised %>% pull(key) %>% unique()
+
+# Create predictor matrix.
+X <- Data %>%
+  # select(one_of(lipids, proteins, nights)) %>%
+  select(-one_of("CHD", "T2DM", bioassays)) %>%
+  as.matrix()
+
+# Create response matrix.
+Y <- Data %>%
+  # select(one_of("10min HDL", "1hr HDL", "2hr HDL", "10min CCCP", "HAEC CDDElisa")) %>%
+  select(one_of("CHD", "T2DM", bioassays)) %>%
+  as.matrix()
+```
+
+<!-- # DIABLO -->
+
+```{r eval=FALSE, include=FALSE}
+blocks <- list(
+  bioassays = Data %>% dplyr::select(bioassays),
+  clinical = Data %>% dplyr::select(clinics %>% setdiff(c("CHD", "T2DM"))),
+  proteomics = Data %>% dplyr::select(proteins),
+  lipidomics = Data %>% dplyr::select(lipids),
+  nightingale = Data %>% dplyr::select(nights))
+block.design <- matrix(1, 5, 5) - diag(5)
+classes <- Data %>%
+  mutate(dummy = (CHD == 1) + 2 * (T2DM == 1)) %>%
+  pull(dummy) %>%
+  factor(labels = c("healthy", "CHD", "T2DM", "CHD+T2DM"))
+
+library(mixOmics)
+staem <- tune.block.splsda(X = blocks, Y = classes, design = block.design)
+Diablo <- block.splsda(X = blocks, Y = classes, design = block.design,
+                       keepX = staem$choice.keepX)
+
+plotIndiv(Diablo)
+plotVar(Diablo)
+plotLoadings(Diablo)
+pdf("plots/circosPlot.pdf")
+circosPlot(Diablo, cutoff = 0.75)
+dev.off()
+```
+
+# The spls package
+
+```{r}
+set.seed(24)
+spls_cv <- cv.spls(X, Y, K = 1:5, eta = seq(0.1, 0.9, 0.1),
+                   scale.x = FALSE, scale.y = FALSE)
+saveRDS(spls_cv, "computations/spls_cv_seed24_fin.rds")
+# spls_cv <- readRDS("computations/spls_cv_seed24_fin.rds")
+spls_fit <- spls(X, Y, eta = spls_cv$eta.opt, K = spls_cv$K.opt,
+                 scale.x = FALSE, scale.y = FALSE)
+set.seed(42)
+spls_ci <- ci.spls(spls_fit)
+spls_correct <- correct.spls(spls_ci)
+
+nonzero.row.idx <- apply(spls_correct, 1, function(x) any(x != 0)) %>% which()
+nonzero.col.idx <- apply(spls_correct, 2, function(x) any(x != 0)) %>% which()
+
+spls_correct_pruned <- spls_correct[nonzero.row.idx, nonzero.col.idx]
+
+extremeValue <- range(spls_correct_pruned) %>% abs() %>% max() %>% signif(2)
+legendPalette <- colorRampPalette(rev(brewer.pal(n = 11, name = "RdYlBu")))(100)
+legendPalette[50] <- "white"
+legendBreaks <- seq(-extremeValue, extremeValue, length.out = 101)
+
+feature.annotation <- bind_rows(clinical.completed,
+                                #functional.normalised,
+                                lipidomics.normalised,
+                                proteomics.normalised,
+                                nightingale.normalised) %>%
+  select(key, `data source`) %>%
+  distinct() %>%
+  filter(key %in% rownames(spls_correct_pruned)) %>%
+  column_to_rownames("key")
+# Use the same colours as for the Gaussian graphical model.
+colourz <- brewer.pal(n = 9, name = "Pastel1")[c(3,2,5,1,4)]
+```
+
+```{r}
+graphics.off()
+pdf("plots/Fig_3_sPLS_hospital+gender_adjusted.pdf", width = 7, height = 7)
+pheatmap(spls_correct_pruned,
+         # main = "Sparse partial least squares (sPLS) regression coefficients",
+         fontsize_row = 5,
+         fontsize_col = 10,
+         color = legendPalette,
+         border_color = "white",
+         legend_breaks = signif(extremeValue * c(-1, -.5, 0, .5, 1), 2),
+         # annotation_legend_bottom = TRUE,
+         annotation_row = feature.annotation,
+         annotation_colors = list(`data source` = c(clinical = colourz[1],
+                                                    lipidomics = colourz[3],
+                                                    proteomics = colourz[4],
+                                                    "NMR spec" =
+                                                      colourz[5])),
+         breaks = legendBreaks,
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation")
+dev.off()
+```
+
+```{r eval=FALSE, include=FALSE}
+spls_correct_pruned %>%
+  as.data.frame() %>%
+  rownames_to_column("predictor") %>%
+  as_tibble() %>%
+  gather(key = "response", value = "coefficient", -predictor) %>%
+  # mutate(response = factor(response, levels = responseLevels)) %>%
+  mutate(coefficient = ifelse(coefficient == 0, NA, coefficient)) %>%
+  ggplot(aes(predictor, response)) +
+  theme_minimal() +
+  geom_tile(aes(fill = coefficient), color = "white") +
+  #Creating legend
+  # guides(fill = guide_colorbar() +
+  #Creating color range
+  scale_fill_distiller(palette = "RdYlBu", na.value = "white",
+                       limits = max(abs(range(spls_correct_pruned)))*c(-1, 1)) +
+  # guide = "colorbar") +
+  #Rotating labels
+  theme(axis.text.x = element_text(angle = 315, hjust = 0, vjust = 1)) +
+  labs(title = "Coefficients in sparse PLS",
+       subtitle = "Excluding coefficients whose bootstrap CI includes 0")
+ggsave("plots/correct_spls.pdf", width = 6.2, height = 3.1)
+```
+
+```{r eval=FALSE, include=FALSE}
+spls_fit$projection %>%
+  as.data.frame() %>%
+  rownames_to_column("feature") %>%
+  ggplot(aes(`Comp 1`, `Comp 2`, label = feature)) +
+  geom_text(show.legend = FALSE)
+
+test <- pls::plsr(spls_fit$y ~ spls_fit$x[, spls_fit$A, drop = FALSE], scale=F,
+                  ncomp = min(spls_fit$K, length(spls_fit$A)), method="simpls")
+rownames(test$projection) <- sub(".*]", "", rownames(test$projection))
+test$loadings %>% str()
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

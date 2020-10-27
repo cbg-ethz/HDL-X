@@ -1,0 +1,304 @@
+---
+title: "Mixed-effects models for functional bioassays"
+subtitle: "Utilising technical replicates and batch/plate information"
+author: "Mathias Cardner"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+header-includes:
+  - \usepackage{booktabs}
+  - \renewcommand{\epsilon}{\varepsilon}
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(xtable.comment = FALSE, xtable.booktabs = TRUE)
+```
+
+## Summary
+
+We analyse each functional bioassay using a mixed model with fixed effects \texttt{diabetes} $\delta$ and \texttt{CHD} $\gamma$, each of which has two levels: present or absent. In order to handle plate effects, we include them as fixed effects. To gain statistical power, we include all technical replicates, and model each sample as a random effect. Additional fixed effects include the rotor used for HDL sample isolation.
+
+### Plots of estimated effects with confidence intervals
+
+We illustrate the results of the mixed models by plotting estimates of fixed and random effects, along with 95% confidence intervals computed using the bootstrap. If the confidence interval of a given effect does \emph{not} contain zero, then that effect is significant at the 5% level.
+
+Note that the bioassays have different experimental designs. For instance, in the MMP assays, batch refers to a group of patient samples analysed on the same day, distributed across several plates.
+
+```{r}
+library(tidyverse)
+# library(xtable)
+library(lme4)
+library(parallel)
+functional.tidy <- readRDS("computations/functional.tidy.rds")
+covariates <- readRDS("computations/covariates.rds")
+
+func.tidy.aug <- functional.tidy %>%
+  left_join(covariates, by = "HDL No") %>%
+  # Not all assays have round information. If so, take it from the dictionary
+  mutate(round = ifelse(is.na(round.x), round.y, round.x)) %>%
+  select(-round.x, -round.y) %>%
+  filter(!is.na(Diabetes), !is.na(CHD))
+bioassays <- functional.tidy %>% pull(key) %>% unique()
+```
+
+```{r}
+lmer_boot <- function(lmer.object, seed = NULL) {
+  lmer.object %>%
+    confint(method = "boot", oldNames = FALSE, seed = seed) %>%
+    as.data.frame() %>%
+    rownames_to_column("Effect") %>%
+    as_tibble() %>%
+    mutate(Effect = sub("round", "", Effect),
+           Effect = sub("rotor", "", Effect),
+           Effect = gsub("TRUE", "", Effect),
+           Effect = sub("^key", "", Effect),
+           `Significant at 5%` = (`2.5 %` * `97.5 %`) > 0,
+           Estimate = (`97.5 %` + `2.5 %`)/2)
+}
+
+lmer_plot <- function(lmer.boot.object, assay) {
+  lmer.boot.object %>%
+    ggplot(aes(x = Effect, y = Estimate, colour = `Significant at 5%`)) +
+    theme_bw() +
+    geom_point() +
+    geom_hline(yintercept = 0) +
+    # geom_pointrange() +
+    geom_errorbar(aes(ymax = `97.5 %`, ymin = `2.5 %`), width = 0.2) +
+    labs(title = paste0(assay),#, ": mixed-effects model"
+         subtitle = "Bootstrap 95% confidence intervals",
+         x = NULL,
+         y = "Estimated effect") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+```
+
+## Results
+
+### Assays where plate is batch
+
+Let's begin with the assays which lack a separate `batch` variable. In other words, the plate is the batch. We want random effects for proband (due to technical replicates) and for plate (due to probands). The plates alias the rounds. The rotor alternates between 1 and 2, which is fine.
+
+```{r}
+plateOnly.assays <- func.tidy.aug %>%
+  filter(is.na(batch), is.na(measurement)) %>%
+  pull(key) %>% unique() %>% as.list()
+names(plateOnly.assays) <- plateOnly.assays
+
+plateOnly.lmer <- lapply(plateOnly.assays, function(assay) {
+  lmer(value ~ plate + (1 | `HDL No`) +
+         Diabetes + CHD + hospital + Female + rotor + `Start isolation`,
+       data = func.tidy.aug %>% filter(key == assay))
+})
+
+plateOnly.lmer.boot <- mclapply(plateOnly.lmer, lmer_boot,
+                                seed = 42, mc.cores = 4)
+saveRDS(plateOnly.lmer.boot, "computations/MixEff_plateOnly_boot_seed42.rds")
+```
+
+```{r eval=FALSE, include=FALSE}
+for(assay in plateOnly.assays) {
+  lmer_plot(plateOnly.lmer.boot[[assay]], assay) %>% print()
+}
+```
+
+### Respiration assays
+
+The plates alias the rounds, so we exclude `round` from the model. Also, the plates (with one exception) alias the rotors, so we also exclude `rotor`.
+
+As per Miro's email on 22.3.2018, nonmitochondrial respiration (Rotenone/Antimycine) should be subtracted from all values. We do this by running `lme4` on the full data of all respiration assays and making `Rotenone/Antimycine` the reference contrast. Furthermore, we include `Diabetes` and `CHD` as main effects, meaning that their coeffcients actually refer to `Rotenone/Antimycine:diseaseTRUE`. Thus for any other assay `key`, the coefficient for `key:diseaseTRUE` records the *offset* effect from `Rotenone/Antimycine:diseaseTRUE`.
+
+Since we have multiple technical replicates per `HDL No`, we need the random intercept `(1 | HDL No)`. However, that is the only random effect we need. Since assays differ in their mean effect, we need a fixed effect for `key`. Furthermore, the plate effects appear to differ between assays (also for PBS), so we include the interaction `key:plate`. Finally, the sampling time `measurement` has a clear effect, which we model by including it as a fixed effect. We don't need `key:measurement`, since measurements are per key. Indeed, `measurement` is *nested* in `key` (e.g. `Measurement 1-3` alias `Baseline`). Thus, for each `key`, one level of `measurement` is dropped. This is done automatically by `lmer`, which reports to have dropped four levels (since one level of `Rotenone/Antimycine` would have been dropped even if there had been no nesting).
+
+```{r}
+respiration.assays <- func.tidy.aug %>%
+  filter(is.na(batch), !is.na(measurement)) %>%
+  pull(key) %>% unique() %>% as.list()
+names(respiration.assays) <- respiration.assays
+
+respiration.lmer <-
+  lmer(value ~ key + Diabetes + CHD + key:Diabetes + key:CHD +
+         # measurement numbers are unique to key, so we need not key:measurement
+         key:plate + measurement + (1 | key:`HDL No`) +
+         key:(hospital + Female + rotor + `Start isolation`),
+       data = func.tidy.aug %>%
+         filter(key %in% respiration.assays, !exclude,
+                # Exclude Measurements 7 and 8, as per Miro's instruction.
+                !measurement %in% paste("Measurement", 7:8)) %>%
+         mutate(key = if_else(key == "Baseline", "basal", key),
+                key = if_else(key == "Oligomycin", "uncoupled", key),
+                key = if_else(key == "cAMP", "cAMP", key),
+                key = if_else(key == "FCCP", "max", key),
+                key = relevel(factor(key), "Rotenone/Antimycine")))
+
+respiration.lmer.boot <- lmer_boot(respiration.lmer, seed = 42)
+saveRDS(respiration.lmer.boot, "computations/MixEff_respiration_boot_seed42.rds")
+```
+
+```{r eval=FALSE, include=FALSE}
+lmer_plot(respiration.lmer.boot %>%
+            filter(!str_detect(Effect, "measurement"),
+                   !str_detect(Effect, "plate")),
+          "Respiration assays (with Rotenone/Antimycine as reference)")
+```
+
+### Edlira's assays
+
+Plates tend to overlap with rotors, so we exclude the `rotor` effect.
+
+```{r}
+func.tidy.aug %>% filter(key == "2hr HDL") %>% select(plate, rotor) %>% table()
+```
+
+```{r}
+plateInBatch.assays <- func.tidy.aug %>%
+  filter(!is.na(batch)) %>%
+  pull(key) %>% unique() %>% as.list()
+names(plateInBatch.assays) <- plateInBatch.assays
+plateInBatch.lmer <- lapply(plateInBatch.assays, function(assay) {
+  lmer(value ~ plate + (1 | `HDL No`) +
+         Diabetes + CHD + hospital + Female + rotor + `Start isolation`,
+       data = func.tidy.aug %>% filter(key == assay))
+})
+
+plateInBatch.lmer.boot <- mclapply(plateInBatch.lmer, lmer_boot,
+                                   seed = 42, mc.cores = 4)
+saveRDS(plateInBatch.lmer.boot, "computations/MixEff_plateInBatch_boot_seed42.rds")
+```
+
+```{r eval=FALSE, include=FALSE}
+for(assay in plateInBatch.assays) {
+  lmer_plot(plateInBatch.lmer.boot[[assay]], assay) %>% print()
+}
+```
+
+# Presentation
+
+```{r}
+# library(tidyverse)
+# plateOnly.lmer.boot <- readRDS("computations/MixEff_plateOnly_boot_seed42.rds")
+# respiration.lmer.boot <- readRDS("computations/MixEff_respiration_boot_seed42.rds")
+# plateInBatch.lmer.boot <- readRDS("computations/MixEff_plateInBatch_boot_seed42.rds")
+
+moj <- c(plateOnly.lmer.boot, plateInBatch.lmer.boot) %>%
+  bind_rows(.id = "assay") %>%
+  group_by(assay) %>%
+  mutate(`2.5 %` = `2.5 %` / Estimate[Effect == "sigma"],
+         `97.5 %` = `97.5 %` / Estimate[Effect == "sigma"],
+         Estimate = Estimate / Estimate[Effect == "sigma"]) %>%
+  ungroup() %>%
+  bind_rows(respiration.lmer.boot %>%
+              mutate(`2.5 %` = `2.5 %` / Estimate[Effect == "sigma"],
+                     `97.5 %` = `97.5 %` / Estimate[Effect == "sigma"],
+                     Estimate = Estimate / Estimate[Effect == "sigma"]) %>%
+              filter(str_detect(Effect, ":[CD]")) %>%
+              separate(Effect, into = c("assay", "Effect"), sep = ":") %>%
+              mutate(assay = paste("respiration", assay))) %>%
+  filter(Effect %in% c("Diabetes", "CHD")) %>%
+  mutate(assay = ifelse(assay == "Efflux EDTA Plasma",
+                        "Efflux apoB-free plasma", assay),
+         assay = sub("Efflux", "CEC", assay),
+         assay = ifelse(str_detect(assay, " CDDElisa$"),
+                        paste0("apoptosis ", sub("E$", "e",
+                                                 sub(" CDDElisa$", "", assay))),
+                        assay),
+         assay = ifelse(str_detect(assay, "^[:digit:]"),
+                        paste0(sub(" HDL$", "", assay), "-MMP C2C12"), assay),
+         Effect = paste("HDL", sub("Diabetes", "T2DM", Effect)),
+         assay = factor(assay, levels = unique(assay)))
+
+disease_effects_only <- moj %>%
+  rename(`Significant at 5% (not adjusted for multiple testing)` = `Significant at 5%`) %>%
+  ggplot() +
+  aes(y = factor(assay, levels = rev(levels(assay))), x = Estimate,
+      colour = `Significant at 5% (not adjusted for multiple testing)`) +
+  theme_bw() +
+  geom_point() +
+  geom_vline(xintercept = 0, col = "darkgrey") +
+  # geom_pointrange() +
+  geom_errorbarh(aes(xmax = `97.5 %`, xmin = `2.5 %`), height = 0.5) +
+  labs(#title = "Disease effects extracted from mixed-effects models",
+       #subtitle = "Showing 95% bootstrap confidence intervals for effects",
+       #caption = "In the respiration assays, the effects are contrasted against Rotenone/Antimycine",
+       y = "assay",
+       x = "standardised effect size") +
+  facet_wrap(~ Effect, ncol = 2) +
+  theme(legend.position = "top")
+ggsave("plots/Suppl_Fig_4_mixed_effects_hospital+gender_adjusted_standardised.pdf",
+       disease_effects_only, width = 8, height = 5)
+```
+
+```{r eval=FALSE, include=FALSE}
+library(xtable)
+options(xtable.comment = FALSE, xtable.booktabs = TRUE)
+hline <- c(-1, seq(0, nrow(moj) - 1, by = 2), nrow(moj))
+htype <- c("\\toprule\n  ", rep("\\midrule\n  ", 12), "\\bottomrule\n  ")
+sink("/Users/cardnerm/Documents/LaTeX/msb/xtable_diseaseEffects.txt")
+moj %>%
+  arrange(assay) %>%
+  mutate(Significant = ifelse(`Significant at 5%`, "*", "")) %>%
+  select(assay, Effect, Estimate, `2.5 %`, `97.5 %`, Significant) %>%
+  xtable::xtable(caption = "Standardised effects sizes of diseased HDL on
+                 the assayed cellular functions.",
+                 label = "tab:disease_effects",
+                 digits = 3,
+                 # Beware: the first column is row names, but we suppress it.
+                 display = c("s", "s", "s", "g", "g", "g", "s")) %>%
+  print(include.rownames = FALSE, math.style.exponents = TRUE,
+        math.style.negative = TRUE,
+        add.to.row = list(pos = as.list(hline), command = htype),
+        hline.after = NULL)
+sink()
+```
+
+```{r eval=FALSE, include=FALSE}
+caveat <- "The effect of each type of respiration (basal, uncoupled, cAMP-stimulated, and maximal) is contrasted against that of rotenone/antimycine (absorbed into the model intercept), in order to show only mitochondrial respiration."
+format_xtable <- function(lmer.boot, name, long = FALSE) {
+  namn <- ifelse(name == "respiration assays", "adipocyte respiration",
+                 assays.renamed[name])
+  lmer.boot %>%
+    mutate(Significant = ifelse(`Significant at 5%`, "*", "")) %>%
+    select(Effect, Estimate, `2.5 %`, `97.5 %`, Significant) %>%
+    xtable(caption = paste0("Mixed-effects model estimates with \\textbf{",
+                            namn, "} as response. ",
+                            ifelse(name == "respiration assays",
+                                   caveat, "")),
+           label = paste0("tab:", gsub(" ", "_", name)),
+           digits = 3,
+           # Beware: the first column is row names, but we suppress it.
+           display = c("s", "s", "g", "g", "g", "s")) %>%
+    print(include.rownames = FALSE, math.style.exponents = TRUE,
+          math.style.negative = TRUE, tabular.environment = ifelse(long, "longtable", "tabular"))
+}
+
+assays.renamed <- levels(moj$assay)
+names(assays.renamed) <- c(
+  "HAEC CDDElisa",
+  "INS1E CDDElisa",
+  "Efflux EDTA Plasma",
+  "Efflux HDL",
+  "10min HDL",
+  "1hr HDL",
+  "2hr HDL",
+  "10min CCCP",
+  "Baseline",
+  "cAMP",
+  "FCCP",
+  "Oligomycin"
+)
+
+sink("/Users/cardnerm/Documents/LaTeX/msb/xtable_plateOnly.txt")
+mapply(plateOnly.lmer.boot, names(plateOnly.lmer.boot), FUN = format_xtable)
+sink()
+sink("/Users/cardnerm/Documents/LaTeX/msb/xtable_plateInBatch.txt")
+mapply(plateInBatch.lmer.boot, names(plateInBatch.lmer.boot), FUN = format_xtable)
+sink()
+sink("/Users/cardnerm/Documents/LaTeX/msb/xtable_respirationAssays.txt")
+format_xtable(respiration.lmer.boot, "respiration assays", long = TRUE)
+sink()
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

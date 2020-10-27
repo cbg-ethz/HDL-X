@@ -1,0 +1,459 @@
+---
+title: "Proteomics and lipidomics"
+subtitle: "Disease association and normalisation adjusted for nuisance variables"
+author: "Mathias Cardner"
+abstract: "We use linear regression models to adjust for HDL isolation round and rotor. Based on the normalised data, we assess the univariate association between protein/lipid abundance and the presence of diabetes and/or CHD."
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: pdf_document
+bibliography: refs.bibtex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(xtable.comment = FALSE, xtable.booktabs = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(ggrepel)
+library(modelr)
+library(pheatmap)
+library(RColorBrewer)
+lipidomics.tidy <- readRDS("computations/lipidomics.tidy.rds")
+proteomics.tidy <- readRDS("computations/proteomics.tidy.rds") %>%
+  mutate(key = ifelse(key == "PHLD", "GPLD1", key))
+dictionary <- readRDS("computations/dictionary.rds")
+```
+
+# Check for differences in quantification between rounds
+
+```{r}
+controls <- dictionary %>%
+  filter(str_detect(`Proband ID`, "CTRL")) %>%
+  pull(`HDL No`)
+
+check_for_LLOQ <- function(dF, titl = "") {
+  dF %>%
+    filter(`HDL No` %in% controls) %>%
+    group_by(key, round) %>%
+    summarise(value = median(value)) %>%
+    ungroup() %>%
+    mutate(round = parse_number(round)) %>%
+    ggplot(aes(round, value, colour = key)) +
+    theme_minimal() +
+    labs(title = titl) +
+    geom_line(show.legend = F) +
+    scale_y_log10()
+}
+
+lipidomics.tidy %>% check_for_LLOQ(titl = "Lipidomics")
+proteomics.tidy %>% check_for_LLOQ(titl = "Proteomics")
+```
+
+Aside from the fact that some lipids drop out in round 2, there appears to be no great difference in quantification levels. Indeed, the Wilcoxon test on control medians yields p =.65.
+
+## Blank lipidomics samples
+
+```{r}
+lipidomics.tidy %>%
+  filter(str_detect(`HDL No`, "Blank"), value != 0) %>%
+  ggplot(aes(parse_number(round), value, colour = key)) +
+  geom_path(show.legend = F) +
+  scale_y_log10()
+
+dat <- lipidomics.tidy %>%
+  filter(str_detect(`HDL No`, "Blank")) %>%
+  group_by(key) %>%
+  mutate(keepers = all(value != 0)) %>%
+  ungroup() %>%
+  filter(keepers) %>%
+  select(round, key, value) %>%
+  spread(key, value) %>%
+  column_to_rownames("round") %>%
+  as.matrix()
+
+wilcox.test(dat[1,], dat[2,], paired = T)
+```
+
+<!-- # Overview by lipid class -->
+
+```{r eval=FALSE, include=FALSE}
+lipidomics.tidy %>%
+  # Split the phosphatidylcholines into two categories, for legibility
+  mutate(`lipid class` = ifelse(`lipid class` == "Phosphatidylcholine" &
+                                  str_detect(key, "^PC O"),
+                                "Phosphatidylcholine (PC O)",
+                                `lipid class`)) %>%
+  group_by(key) %>%
+  mutate(anyZero = any(value == 0)) %>%
+  ungroup() %>%
+  filter(anyZero) %>%
+  ggplot(aes(key, value, colour = round)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  facet_wrap(~ `lipid class`, scales = "free_x") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Only keep lipids with less than half measurements being zero.
+lipidomics.tidy <- lipidomics.tidy %>%
+  # Exclude control and failed samples (relies on DataProcessing.Rmd)
+  filter(!exclude) %>%
+  group_by(key) %>%
+  mutate(`proportion of zeros` = mean(value == 0)) %>%
+  ungroup() %>%
+  filter(`proportion of zeros` < 0.5)
+```
+
+# Data exploration
+
+## PCA
+
+```{r}
+proteomics.spread <- proteomics.tidy %>%
+  group_by(key, round) %>%
+  mutate(LLOQ = ifelse(any(value == 0),
+                       min(setdiff(value, c(0, 1)), na.rm = TRUE), 0)) %>%
+  ungroup() %>%
+  mutate(value = log2(value + LLOQ)) %>%
+  select(`HDL No`, key, value) %>%
+  spread(key, value) %>%
+  column_to_rownames("HDL No")
+pca.proteomics <- prcomp(proteomics.spread, scale. = TRUE)
+
+lipidomics.spread <- lipidomics.tidy %>%
+  group_by(key, round) %>%
+  mutate(LLOQ = ifelse(any(value == 0),
+                       min(setdiff(value, c(0, 1)), na.rm = TRUE), 0)) %>%
+  ungroup() %>%
+  mutate(value = log2(value + LLOQ)) %>%
+  select(`HDL No`, key, value) %>%
+  spread(key, value) %>%
+  column_to_rownames("HDL No")
+pca.lipidomics <- prcomp(lipidomics.spread, scale. = TRUE)
+```
+
+<!-- ### biplots -->
+
+```{r}
+# pdf("plots/biplots.pdf", width = 8.27, height = 4.135)
+layout(matrix(rep(rep(c(1, 2), each = 3), 3), byrow = TRUE, nrow = 3))
+biplot(pca.lipidomics, main = "Lipidomics", font.main = 1, arrow.len = 0.05)
+biplot(pca.proteomics, main = "Proteomics", font.main = 1, arrow.len = 0.05)
+# dev.off()
+```
+
+<!-- ### screeplots -->
+
+```{r}
+# Compute percent of total variance explained, and keep only the top ten
+pca.lip.var <- (100 * pca.lipidomics$sdev^2/sum(pca.lipidomics$sdev^2))[1:10]
+pca.prot.var <- (100 * pca.proteomics$sdev^2/sum(pca.proteomics$sdev^2))[1:10]
+
+# pdf("plots/screeplots.pdf", width = 8.27, height = 1.75)
+layout(matrix(rep(c(1, 2), each = 3), byrow = TRUE, nrow = 1))
+plot(1:10, pca.lip.var,
+     main = "Lipidomics", font.main = 1, axes = FALSE,
+     type = "b", pch = 20, xlab = "Component", ylab = "% variance")
+axis(2, at = range(pca.lip.var), labels = round(range(pca.lip.var)))
+axis(1, at = 1:10, labels = 1:10)
+plot(1:10, pca.prot.var,
+     main = "Proteomics", font.main = 1, axes = FALSE,
+     type = "b", pch = 20, xlab = "Component", ylab = "% variance")
+axis(2, at = range(pca.prot.var), labels = round(range(pca.prot.var)))
+axis(1, at = 1:10, labels = 1:10)
+# dev.off()
+```
+
+### ggplot
+
+```{r}
+bind_rows(proteomics = pca.proteomics$x %>%
+            as.data.frame() %>%
+            rownames_to_column("HDL No") %>%
+            as_tibble(),
+          lipidomics = pca.lipidomics$x %>%
+            as.data.frame() %>%
+            rownames_to_column("HDL No") %>%
+            as_tibble(),
+          .id = "omicsType") %>%
+  left_join(dictionary %>%
+              mutate(`isolation date` =
+                       factor(`Start isolation`,
+                              levels = unique(`Start isolation`))),
+            by = "HDL No") %>%
+  ggplot() +
+  aes(x = PC1, y = PC2, alpha = rotor, size = round,
+             colour = `isolation date`, shape = hospital) +
+  theme_bw() +
+  guides(col = guide_legend(ncol = 2)) +
+  # labs(title = "Principal component analyses of omics data",
+  #      subtitle = expression(log[2](value + LLOQ/sqrt(2)))) +
+  geom_point() +
+  scale_size_discrete(range = c(1, 2)) +
+  scale_alpha_discrete(range = c(0.25, 1)) +
+  facet_wrap(~ omicsType)
+ggsave("plots/PCA_omics_scaled_log2.pdf", width = 8.27, height = 4.5)
+```
+
+For both technical and statistical reasons, it is advisable to logarithmically transform mass spectrometry data [@Mertens2017]. Indeed, in our proteomic and lipidomic datasets, log transforming the raw values yields rather bell-shaped distributions.
+
+```{r}
+omics.tidy <- bind_rows(lipidomics = lipidomics.tidy,
+                        proteomics = proteomics.tidy,
+                        `NMR spectroscopy` =
+                          readRDS("computations/nightingale.tidy.rds"),
+                        .id = "data source")
+omics.tidy %>%
+  filter(value != 0) %>%
+  mutate(log.value = log2(value)) %>%
+  group_by(key) %>%
+  mutate(scaled.log.value = scale(log.value)) %>%
+  ungroup() %>%
+  ggplot() +
+  aes(scaled.log.value) +
+  theme_bw() +
+  # labs(title = "Histogram of omics data",
+  #      subtitle = "Logarithmic transform of raw values") +
+  labs(x = expression(log[2] ~ "value, standardised per feature")) +
+  geom_histogram(bins = 100, position = "identity", alpha = 0.75) +
+  scale_fill_brewer(palette = "Dark2") +
+  facet_wrap(~ `data source`, nrow = 1, scales = "free")
+ggsave("plots/Histogram_omics.pdf", width = 8.27, height = 2.76)
+```
+
+However, some measurements are 0, which is problematic since $\log(0)=-\infty$. This is commonly addressed by adding an appropriate constant (pseudo-count) to all measurements before log transforming. For clinical variables, when a measurement was below the lower limit of quantification (LLOQ), we set them to $\mathrm{LLOQ}/\sqrt2$; see [@LLOQ]. Here we adopt a similar approach. For proteomics and lipidomics (separately) we estimate the LLOQ by the smallest non-zero measurement observed in our data. When then add a pseudo-count of $\mathrm{LLOQ}$ to all measurements before applying the log transform.
+
+```{r eval=FALSE, include=FALSE}
+# Plot sd against mean
+SDvsMean <- function() {
+  lipidomics.tidy %>%
+    group_by(key, round) %>%
+    mutate(LLOQ = ifelse(any(value == 0),
+                         min(setdiff(value, c(0, 1)), na.rm = TRUE), 0)) %>%
+    ungroup() %>%
+    # Add a pseudo-count to allow for logarithmic transformation
+    mutate(value = log2(value + LLOQ)) %>%
+    filter(is.finite(value)) %>%
+    group_by(key, round) %>%
+    summarise(mean = mean(value, na.rm = T), sd = sd(value, na.rm = T),
+              zeroness = mean(`proportion of zeros`)) %>%
+    ungroup() %>%
+    ggplot(aes(mean, sd, colour = round, size = zeroness)) +
+    labs(title = "Lipidomics",
+         subtitle = "Relationship between standard deviation and mean") +
+    theme_bw() +
+    geom_point()
+}
+SDvsMean()
+```
+
+The data contains `r proteomics.tidy %>% pull(key) %>% unique() %>% length()` quantified proteins, and `r lipidomics.tidy %>% pull(key) %>% unique() %>% length()` lipid species. The protein names and descriptions are included at the end of this document. The lipid species belong to the following classes.
+
+Abbreviation | Lipid Class
+------------ | -----------
+CE | Cholesteryl Ester
+Cer | Ceramide
+FC | Free Cholesterol
+HexCer | Hexosylceramide
+LPC | Lysophosphatidylcholine
+LSM | Lysosphingomyelin
+PC | Phosphatidylcholine
+PE | Phosphatidylethanolamine
+PE P | PE-based plasmalogens
+PI | Phosphatidylinositol
+SM | Sphingomyelin
+
+```{r}
+# Count lipid species per class. First, correct some incorrect class labels
+lipidomics.tidy %>%
+  filter(`HDL No` == "HDL_77") %>%
+  mutate(`lipid class` =
+           ifelse(str_detect(key, "^FC"), "Free Cholesterol", `lipid class`),
+         `lipid class` =
+           ifelse(str_detect(key, "^HexCer"), "Hexosylceramide", `lipid class`),
+         `lipid class` =
+           ifelse(str_detect(key, "^LSM"), "Lysosphingomyelin", `lipid class`)) %>%
+  group_by(`lipid class`) %>%
+  summarise(n())
+```
+
+# Linear model for normalising data
+
+HDL samples were isolated in two different rounds, on seven different dates, using two different rotors, at two different hospitals. This has introduced batch effects in the data, for which we adjust using a linear regression model. Concretely, we want to remove the effects of nuisance variables, but not the effects of disease conditions. However, we must be careful when adjusting, because the hospital effect is to a large extent confounded with the CHD signal, since most CHD patients were sampled in Berlin.
+
+As discussed with Giusi, it would be prudent to adjust for hospital, since its effect is otherwise attributed to CHD. As suggested by Jack, it would be best to model Y ~ diabetes + CHD + rotor + `Start isolation` + hospital, and then use for downstream analysis Yhat <- intercept + diabetes + CHD + residual.
+
+Ideally, the volcano plots should be rendered from the above model.
+
+```{r}
+clinical.completed <- readRDS("computations/clinical.completed.rds")
+covariates <- dictionary %>%
+  left_join(clinical.completed %>%
+              filter(key == "Female") %>%
+              mutate(Female = as.logical(value)) %>%
+              select(`Proband ID`, Female),
+            by = "Proband ID") %>%
+  select(`HDL No`, `Proband ID`, round, `Start isolation`, rotor, hospital,
+         Female, Diabetes, CHD)
+saveRDS(covariates, "computations/covariates.rds")
+
+# pdf("plots/Correlations_between_disease_and_covariates.pdf", width=7, height=5)
+covariates %>%
+  select(-`HDL No`, -`Proband ID`, -round) %>%
+  model_matrix(~ .) %>%
+  select(-`(Intercept)`) %>%
+  cor() %>%
+  pheatmap(main = "Correlations between disease and nuisance variables",
+           color = colorRampPalette(rev(brewer.pal(n = 7, name="RdBu")))(100),
+           breaks = seq(-1, 1, length.out = 101), # 1 more break than colours
+           cluster_rows = FALSE,
+           cluster_cols = FALSE)
+# dev.off()
+
+covariates %>%
+  filter(!is.na(Diabetes) & !is.na(CHD)) %>%
+  select(Diabetes, CHD, hospital) %>% # table()
+  count(Diabetes, CHD, hospital)
+# model_matrix(~ hospital + Diabetes * CHD) %>% View
+```
+
+## Nested linear models adjusting for `hospital` and `Start isolation`
+
+### Functions
+
+```{r}
+source("helper_normalisation.R")
+source("helper_volcanoes.R")
+```
+
+### Lipidomics
+
+```{r}
+protein.aug <- proteomics.tidy %>%
+  # Drop some variables which interfere with spread()
+  select(-starts_with("protein")) %>%
+  log_and_add_covariates()
+
+lipid.aug <- lipidomics.tidy %>%
+  # Drop some variables which interfere with spread()
+  select(-exclude, -`lipid class`, -`proportion of zeros`) %>%
+  log_and_add_covariates()
+
+lipid.nested.lm.fits <- nested_lm_fits(lipid.aug)
+lipid.lm.brooms <- lm_brooms(lipid.nested.lm.fits)
+lipid.lm.brooms.adjusted <- lm_brooms_adjusted(lipid.lm.brooms)
+lipid.lm.brooms.normalised <- lm_brooms_normalise(lipid.lm.brooms) %>%
+  # Explicitly ungroup, to address a recent change to dplyr.
+  ungroup() %>%
+  mutate(`data source` = "lipidomics")
+
+protein.nested.lm.fits <- nested_lm_fits(protein.aug)
+protein.lm.brooms <- lm_brooms(protein.nested.lm.fits)
+protein.lm.brooms.adjusted <- lm_brooms_adjusted(protein.lm.brooms)
+protein.lm.brooms.normalised <- lm_brooms_normalise(protein.lm.brooms) %>%
+  # Explicitly ungroup, to address a recent change to dplyr.
+  ungroup() %>%
+  mutate(`data source` = "proteomics")
+
+saveRDS(lipid.lm.brooms.normalised, "computations/lipidomics.normalised.fin.rds")
+saveRDS(protein.lm.brooms.normalised, "computations/proteomics.normalised.fin.rds")
+
+# The following lines confirmed that the new procedure is equivalent to the old!
+# lold <- readRDS("computations/lipidomics.normalised.fin.rds")
+# pold <- readRDS("computations/proteomics.normalised.fin.rds")
+# identical(protein.lm.brooms.normalised$key, pold$key)
+# identical(protein.lm.brooms.normalised$`HDL No`, pold$`HDL No`)
+# all.equal(protein.lm.brooms.normalised$value, pold$value)
+# identical(lipid.lm.brooms.normalised$key, lold$key)
+# identical(lipid.lm.brooms.normalised$`HDL No`, lold$`HDL No`)
+# all.equal(lipid.lm.brooms.normalised$value, lold$value)
+
+dictionary %>% select(hospital, Diabetes, CHD) %>% table
+
+lipid.volcano <- lipid.lm.brooms.adjusted %>%
+  plot_volcano(titl = "Lipidomics")
+ggsave("plots/Suppl_Fig_2_volcano_lipidomics.pdf",
+       plot = lipid.volcano, width = 7, height = 9)
+
+protein.volcano <- protein.lm.brooms.adjusted %>%
+  plot_volcano(titl = "Proteomics")
+ggsave("plots/Suppl_Fig_3_volcano_proteomics.pdf",
+       plot = protein.volcano, width = 7, height = 9)
+
+# for(i in 1:nrow(nested.lm.fits)) {
+#   pdf(paste0("plots/lm_diagnostics/", gsub("/", "-", nested.lm.fits$key[i]), ".pdf"),
+#       width = 10, height = 10)
+#   par(mfrow = c(2,2))
+#   plot(nested.lm.fits$linMod[[i]])
+#   dev.off()
+# }
+```
+
+# Print volcano data to text files
+
+```{r eval=FALSE, include=FALSE}
+sink("/Users/cardnerm/Documents/LaTeX/msb/print_protein_volcano.txt")
+print_significant_omics(protein.lm.brooms.adjusted)
+sink()
+```
+
+```{r eval=FALSE, include=FALSE}
+sink("/Users/cardnerm/Documents/LaTeX/msb/print_lipid_volcano.txt")
+print_significant_omics(lipid.lm.brooms.adjusted)
+sink()
+```
+
+## Q--Q plots
+
+```{r}
+# set.seed(42)
+bind_rows(lipid.lm.brooms.normalised, protein.lm.brooms.normalised,
+          readRDS("computations/functional.normalised.fin.rds"),
+          readRDS("computations/nightingale.normalised.fin.rds") %>%
+            mutate(`data source` = "NMR spectroscopy")) %>%
+  group_by(key) %>%
+  mutate(`scaled residual` = scale(value)) %>%
+  ungroup() %>%
+  # group_by(`data source`) %>%
+  # sample_frac(size = 0.1) %>%
+  # ungroup() %>%
+  ggplot(aes(sample = `scaled residual`)) +
+  theme_bw() +
+  # scale_colour_brewer(palette = "Dark2") +
+  # labs(title = "Normal Q–Q plots",
+  #      subtitle = paste("Normalised omics data adjusted for",
+  #                       "HDL isolation round, date, and rotor")) +
+  geom_qq(show.legend = F) +
+  geom_qq_line(show.legend = F) +
+  facet_wrap(~ `data source`, nrow = 1)
+ggsave("plots/QQ_normalised.pdf", width = 8.27, height = 2.5)
+```
+
+```{r eval=FALSE, include=FALSE}
+# Write a csv file of the wide lipidomics data (for Arnold and Lucia)
+lipidomics.tidy %>%
+  select(-`lipid class`, -round, -exclude) %>%
+  spread(key, value) %>%
+  write_csv("HDL-X_lipidomics_both_rounds.csv")
+```
+
+\newpage
+
+# Protein descriptions
+
+```{r results="hide"}
+proteomics.tidy %>%
+  select(key, `protein description`) %>%
+  distinct() %>%
+  knitr::kable()
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
+
+# References

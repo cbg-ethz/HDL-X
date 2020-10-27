@@ -1,0 +1,163 @@
+---
+title: "Logistic regression elastic net regularisation"
+subtitle: "Cross-validation and stability selection"
+author: "Mathias Cardner"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(modelr)
+library(glmnet)
+library(glmnetUtils)
+library(stabs)
+library(parallel)
+```
+
+```{r}
+clinical.completed <- readRDS("computations/clinical.completed.rds")
+functional.normalised <- readRDS("computations/functional.normalised.fin.rds")
+lipidomics.normalised <- readRDS("computations/lipidomics.normalised.fin.rds")
+proteomics.normalised <- readRDS("computations/proteomics.normalised.fin.rds")
+nightingale.normalised <- readRDS("computations/nightingale.normalised.fin.rds") %>%
+  mutate(key = ifelse(key == "HDL-C", "HDL-C (NMR)", key))
+dictionary <- readRDS("computations/dictionary.rds")
+```
+
+# Analysis begins
+
+```{r}
+master <- clinical.completed %>%
+  # Gender has already been adjusted for during normalisation.
+  filter(key != "Female") %>%
+  # Only include patients from the dictionary, which were measured in functional
+  # and omics assays. (Redundant if using clinical.completed)
+  # filter(`Proband ID` %in% dictionary$`Proband ID`) %>%
+  bind_rows(functional.normalised,
+            lipidomics.normalised,
+            proteomics.normalised,
+            nightingale.normalised) %>%
+  select(`Proband ID`, key, value) %>%
+  # Keep only HDL-X samples (and discard HDL controls, rHDL, PBS, etc.)
+  filter(str_detect(`Proband ID`, "^HDLX-")) %>%
+  spread(key, value, convert = FALSE) %>%
+  filter(rowSums(is.na(.)) == 0)
+```
+
+```{r}
+source("helper_functions.R")
+# If omitting clinical data:
+# master <- master %>%
+#   left_join(dictionary %>% select("Proband ID", "CHD", "Diabetes"))
+master.aug <- augment(master)
+```
+
+### CV for alpha and lambda simultaneously
+
+```{r}
+source("my_plot_stabs.R")
+source("my_plot_cvafit.R")
+```
+
+We use `glmet` for elastic net regression. The default behaviour is to standardise covariates, even indicator variables: "The lasso method requires initial standardization of the regressors, so that the penalization scheme is fair to all regressors. For categorical regressors, one codes the regressor with dummy variables and then standardizes the dummy variables" (Tibshirani, Statistics in Medicine. 1997;16(4):385–95).
+
+```{r}
+library(gridExtra)
+source("wrapper_functions.R")
+enCV.diabetes <- elastic_net_CV("Diabetes", seed = 3,
+                                alphas = seq(0, 1, len = 21))
+# multiplot_enCV(enCV.diabetes)
+# saveRDS(enCV.diabetes, "computations/enCV.diabetes.fin.rds")
+# enCV.diabetes <- readRDS("computations/enCV.diabetes.fin.rds")
+
+enCV.CHD <- elastic_net_CV("CHD", seed = 3,
+                           alphas = seq(0, 1, len = 21))
+# multiplot_enCV(enCV.CHD)
+# saveRDS(enCV.CHD, "computations/enCV.CHD.fin.rds")
+# enCV.CHD <- readRDS("computations/enCV.CHD.fin.rds")
+
+enCV.both <- elastic_net_CV("Diabetes and CHD", seed = 3,
+                            alphas = seq(0, 1, len = 21))
+# multiplot_enCV(enCV.both)
+# saveRDS(enCV.both, "computations/enCV.both.fin.rds")
+# enCV.both <- readRDS("computations/enCV.both.fin.rds")
+
+ggsave("plots/cvafit_both.pdf", multiplot_enCV(enCV.both), width = 8.27,height=3)
+
+coefs.tidy <- data.frame(
+  diabetes = coef(enCV.diabetes$fit, s = enCV.diabetes$cvfit$lambda.1se)[,1],
+  chd = coef(enCV.CHD$fit, s = enCV.CHD$cvfit$lambda.1se)[,1],
+  both = coef(enCV.both$fit, s = enCV.both$cvfit$lambda.1se)[,1]) %>%
+  rownames_to_column("feature") %>%
+  as_tibble() %>%
+  filter(diabetes != 0 | chd != 0 | both != 0) %>%
+  # feature != "(Intercept)") %>%
+  rename(`T2DM only` = diabetes,
+         `CHD only` = chd,
+         `CHD+T2DM` = both) %>%
+  gather(key = condition, coefficient, -feature)
+```
+
+```{r}
+stabs.diabetes <- stabDisease("Diabetes", elastic = enCV.diabetes$optimalAlpha,
+                              pfer = 2, ctff = 0.6, seed = 3)
+# plot.stabs(stabs.diabetes)# + guides(col = guide_legend(ncol = 2))
+
+stabs.CHD <- stabDisease("CHD", elastic = enCV.CHD$optimalAlpha,
+                         pfer = 2, ctff = 0.6, seed = 3)
+# plot.stabs(stabs.CHD)# + guides(col = guide_legend(ncol = 2))
+
+stabs.both <- stabDisease("Diabetes and CHD", elastic = enCV.both$optimalAlpha,
+                          pfer = 2, ctff = 0.6, seed = 3)
+# plot.stabs(stabs.both)# + guides(col = guide_legend(ncol = 2))
+```
+
+```{r}
+coefs.tidy %>%
+  mutate(condition = factor(condition, levels =
+                              c("T2DM only", "CHD only", "CHD+T2DM"))) %>%
+  mutate(`stability selection` =
+           ifelse(condition == "T2DM only" &
+                    feature %in% names(stabs.diabetes$selected),
+                  1,
+                  ifelse(condition == "CHD only" &
+                           feature %in% names(stabs.CHD$selected),
+                         1,
+                         ifelse(condition == "CHD+T2DM" &
+                                  feature %in% names(stabs.both$selected),
+                                1, NA)))) %>%
+                    # left_join(stabs.both$selected %>% as_tibble())
+  mutate(coefficient = ifelse(coefficient == 0, NA, coefficient),
+         feature = factor(feature, levels = rev(unique(feature)))) %>%
+  rename(`disease condition` = condition) %>%
+  filter(feature != "(Intercept)") %>%
+  ggplot(aes(`disease condition`, feature)) +
+  # labs(title = "Logistic regression coefficients (elastic net)",
+  #      subtitle = "Colour indicates the sign (+/-) of the coefficients") +
+  theme_classic() +
+  # theme(axis.text.x = element_text(angle = 45, hjust = 0, vjust = -.1)) +
+  geom_tile(aes(fill = coefficient > 0, alpha = abs(coefficient)), color = "white") +
+  geom_text(aes(label = signif(coefficient, 1)), colour = "midnightblue", size = 3) +
+  geom_point(aes(size = `stability selection`), shape = "diamond",
+             position = position_nudge(x = .3)) +
+  # scale_fill_distiller(palette = "RdYlBu", na.value = "white",
+  #                      limits = c(-1.05, 1.05) * extremeValue) +
+  scale_size_continuous(range = c(2, 2)) +
+  scale_alpha(range = c(0.25, 1)) +
+  # theme(axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.5, size = rel(0.9)), legend.position = "top") +
+  # guides(fill = guide_legend(nrow = 3, byrow = FALSE)) +
+  scale_fill_brewer(palette = "Dark2", na.value = "white")
+ggsave("plots/Fig_2_logistic_regression_hospital+gender.pdf", width = 6, height = 8.27)
+# ggsave("plots/Fig_2_logistic_regression_wide.pdf", width = 8.3, height = 4)
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

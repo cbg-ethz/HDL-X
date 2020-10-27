@@ -1,0 +1,268 @@
+---
+title: "Clinical imputation"
+author: "Mathias Cardner"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(mice)
+clinical.tidy <- readRDS("computations/clinical.tidy.rds")
+dictionary <- readRDS("computations/dictionary.rds")
+```
+
+```{r}
+clinical.spread <- clinical.tidy %>%
+  # Keep only patients whose HDL samples were isolated. This effectively
+  # excludes HDLX-1017, 2031, 2055, and 2056, the last of whom has 25 missing
+  # clinical data points
+  filter(`Proband ID` %in% dictionary$`Proband ID`) %>%
+  # Make feature names neat, since MICE requires ASCII without (, ), /, and -
+  mutate(key = gsub("ä", "ae", key),
+         key = gsub("ö", "oe", key),
+         key = gsub(" \\(.*", "", key), # omit trailing units (confirmed)
+         key = gsub(" ", "_", key),
+         key = gsub("[()]", ".", key), # this affects only Lp(a) -> Lp.a.
+         key = gsub("-", ".", key)) %>% # hyphenated features suffer from this
+  select(`Proband ID`, key, value) %>%
+  spread(key, value)
+```
+
+# Manual predictions based on common sense
+
+Two patients (HDLX-3001 and 3002) lack measurements of Bauchumfang, but they do have data on BMI. Due to the obvious connection between these variables, we predict the missing data through simple linear regression. Concretely, we regress Bauchumfang (response) on BMI (covariate), and predict the two missing data points by setting them to the fitted regression value (line) at the corresponding BMI values. The benefit of this prediction is that we can keep Bauchumfang (which was a stronger predictor than BMI in our stability selection), but predict it via the BMI for the two patients lacking measurements of Bauchumfang.
+
+Similarly, four patients lack data on daily alcohol consumption (binary), but three of them do have data on grams of alcohol per week. Again, due to the obvious connection between these variables, we predict the former from the latter (which has a total of 35 missing data points, and will ultimately be excluded altogether).
+
+```{r}
+# Fit ordinary simple regression of Bauchumfang on BMI
+lm.bmi <- lm(Bauchumfang ~ BMI, data = clinical.spread)
+# plot(lm.bmi)
+# summary(lm.bmi)
+
+# Fit logistic regression to predict daily alcohol comsumption (binary) from
+# grams of alcohol per week
+glm.alcohol <- glm(taeglicher_Alkohol.konsum ~ Alkohol_pro_Woche,
+                   data = clinical.spread, family = binomial(link = "logit"))
+# plot(glm.alcohol)
+# summary(glm.alcohol)
+```
+
+```{r results="hide"}
+# Sort features based on number of missing data points
+clinical.spread %>%
+  select(which(colSums(is.na(.)) > 0)) %>%
+  is.na() %>%
+  colSums() %>%
+  sort()
+
+# Some features are quite uninteresting, and lack many data points
+rightOut <- c("Statine", "RAAS_inhibitors", "Alkohol_pro_Woche",
+              "taeglicher_Alkohol.konsum", "KHK.Vorgeschichte")
+
+clinical.spread <- clinical.spread %>%
+  # Predict missing values for BMI and taeglicher_Alkoholkonsum (note missing
+  # hyphen) based on regression models compute above
+  mutate(taeglicher_Alkoholkonsum = ifelse(is.na(taeglicher_Alkohol.konsum),
+                                           # check if predicted log-odds > 0
+                                           predict(glm.alcohol, newdata = .,
+                                                   type = "link") > 0,
+                                           taeglicher_Alkohol.konsum),
+         Bauchumfang = ifelse(is.na(Bauchumfang),
+                              predict(lm.bmi, .),
+                              Bauchumfang)) %>%
+  # Remove uninteresting variables with many missing values
+  select(-one_of(rightOut))
+
+# Convert Proband ID to rownames, for the benefit of MICE
+clinical <- column_to_rownames(clinical.spread, "Proband ID")
+clinical.translated <- clinical %>%
+  rownames_to_column("Proband ID") %>%
+  as_tibble() %>%
+  gather(key, value, -`Proband ID`) %>%
+  mutate(key = replace(key, key == "Alter", "Age"),
+         key = replace(key, key == "ApoA.I", "ApoA-I"),
+         key = replace(key, key == "Bauchumfang", "Waist circumference"),
+         key = replace(key, key == "Blutdruck_diastolisch", "BP diastolic"),
+         key = replace(key, key == "Blutdruck_systolisch", "BP systolic"),
+         key = replace(key, key == "Cholesterin", "Cholesterol"),
+         key = replace(key, key == "Diabetes_bekannt", "Diabetes"),
+         key = replace(key, key == "Erythrozyten", "Erythrocytes"),
+         key = replace(key, key == "Gewicht", "Weight"),
+         key = replace(key, key == "Glukose", "Glucose"),
+         key = replace(key, key == "Groesse", "Height"),
+         key = replace(key, key == "HbA1c_IFCC", "HbA1c IFCC"),
+         key = replace(key, key == "HDL.C", "HDL-C"),
+         key = replace(key, key == "Herz.frequenz", "Heart rate"),
+         key = replace(key, key == "Hypertonie_bekannt", "Hypertension"),
+         key = replace(key, key == "KHK_bekannt", "CHD"),
+         key = replace(key, key == "Kreatinin", "Creatinine"),
+         key = replace(key, key == "LDL.C", "LDL-C"),
+         key = replace(key, key == "Leukozyten", "Leukocytes"),
+         key = replace(key, key == "Lp.a.", "Lp(a)"),
+         key = replace(key, key == "Nieren.erkrankung_bekannt", "Kidney disease"),
+         key = replace(key, key == "non.HDL.C", "non-HDL-C"),
+         key = replace(key, key == "Raucher", "Smoker"),
+         key = replace(key, key == "taeglicher_Alkoholkonsum", "Daily alcohol consumption"),
+         key = replace(key, key == "Thrombozyten", "Thrombocytes"),
+         key = replace(key, key == "Triglyceride", "Triglycerides")) %>%
+  spread(key, value) %>%
+  column_to_rownames("Proband ID")
+
+source("my.pattern.R")
+pdf("plots/md_pattern.pdf", width = 8.27, height = 4)
+my.pattern(clinical.translated, abbrv = 25)
+dev.off()
+```
+
+MICE features several methods, most of which yield a stochastic imputation. We want a deterministic imputation method, namely "norm.predict" for continuous variables, and "logreg" for binary. Although the imputation procedure is deterministic, the "data.init" argument introduces randomness (https://stackoverflow.com/questions/47389167/multivariate-deterministic-regression-imputation-via-mice-leads-to-unstable-resu), so we set the seed inside mice() to 42.
+
+```{r}
+binaries <- lapply(c("bekannt", "Female", "taeglicher", "Raucher"), function(x)
+  grep(x, colnames(clinical))) %>% unlist()
+impMethod <- rep("norm.predict", ncol(clinical))
+impMethod[binaries] <- "logreg"
+moess <- mice(clinical, method = impMethod, m = 1, seed = 42, printFlag = FALSE)
+pdf("plots/densityplot.pdf", width = 8.27, height = 2.76)
+densityplot(moess)
+dev.off()
+
+# MICE returns a list of data frames containing imputed values. Convert rownames
+# to variables in each data frame, then bind_rows
+clinical.imputed <- lapply(moess$imp, rownames_to_column, var="Proband ID") %>%
+  bind_rows(.id = "key") %>%
+  as_tibble() %>%
+  rename(imputed = `1`)
+
+# Finally, left_join the imputed values to the original data. I have confirmed
+# that "value" and "imputed" partition the entire data set. Add a variable
+# called "complete" which contains the original value when available; otherwise
+# the imputed value
+clinical.completed <- clinical.spread %>%
+  gather(key, value, -`Proband ID`) %>%
+  left_join(clinical.imputed, by = c("Proband ID", "key")) %>%
+  mutate(value = ifelse(is.na(value), imputed, value),
+         `data source` = "clinical") %>%
+  # Translate German variable names into English
+  mutate(key = replace(key, key == "Alter", "Age"),
+         key = replace(key, key == "ApoA.I", "ApoA-I"),
+         key = replace(key, key == "Bauchumfang", "Waist circumference"),
+         key = replace(key, key == "Blutdruck_diastolisch", "BP diastolic"),
+         key = replace(key, key == "Blutdruck_systolisch", "BP systolic"),
+         key = replace(key, key == "Cholesterin", "Cholesterol"),
+         key = replace(key, key == "Diabetes_bekannt", "Diabetes"),
+         key = replace(key, key == "Erythrozyten", "Erythrocytes"),
+         key = replace(key, key == "Gewicht", "Weight"),
+         key = replace(key, key == "Glukose", "Glucose"),
+         key = replace(key, key == "Groesse", "Height"),
+         key = replace(key, key == "HbA1c_IFCC", "HbA1c IFCC"),
+         key = replace(key, key == "HDL.C", "HDL-C"),
+         key = replace(key, key == "Herz.frequenz", "Heart rate"),
+         key = replace(key, key == "Hypertonie_bekannt", "Hypertension"),
+         key = replace(key, key == "KHK_bekannt", "CHD"),
+         key = replace(key, key == "Kreatinin", "Creatinine"),
+         key = replace(key, key == "LDL.C", "LDL-C"),
+         key = replace(key, key == "Leukozyten", "Leukocytes"),
+         key = replace(key, key == "Lp.a.", "Lp(a)"),
+         key = replace(key, key == "Nieren.erkrankung_bekannt", "Kidney disease"),
+         key = replace(key, key == "non.HDL.C", "non-HDL-C"),
+         key = replace(key, key == "Raucher", "Smoker"),
+         key = replace(key, key == "taeglicher_Alkoholkonsum", "Daily alcohol consumption"),
+         key = replace(key, key == "Thrombozyten", "Thrombocytes"),
+         key = replace(key, key == "Triglyceride", "Triglycerides")
+  )
+
+saveRDS(clinical.completed, "computations/clinical.completed.newMICEversion.rds")
+```
+
+# Summary table
+
+Below we summarise the clinical measurements in a table showing averages for each disease condition.
+
+```{r results="hide"}
+binary.names <- unique(clinical.completed$key)[binaries]
+
+clin.comp.cond <- clinical.completed %>%
+  filter(is.na(imputed), !key %in% c("Diabetes", "CHD")) %>%
+  left_join(dictionary %>%
+              # Exclude patient samples lacking all lipidomics measurements.
+              filter(!`HDL No` %in% paste("HDL", 75:76, sep = "_")) %>%
+              mutate(condition = ifelse(!Diabetes & !CHD, "Healthy volunteers",
+                                        ifelse(Diabetes & !CHD, "Diabetes only",
+                                               ifelse(!Diabetes & CHD, "CHD only",
+                                                      "Diabetes and CHD")))) %>%
+              select(`Proband ID`, condition), by = "Proband ID") %>%
+  filter(!is.na(condition))
+
+test <- clin.comp.cond %>%
+  group_by(condition, key) %>%
+  summarise(average = mean(value), stddev = sd(value)) %>%
+  ungroup() %>%
+  mutate(stats = ifelse(key %in% binary.names, signif(100 * average, 2),
+                        paste0(signif(average, 2), " (", signif(stddev, 2), ")")),
+         condition = factor(condition,
+                            levels = c("Healthy volunteers", "Diabetes only",
+                                       "CHD only", "Diabetes and CHD"))) %>%
+  select(key, condition, stats) %>%
+  spread(condition, stats)
+
+units_clinical <- bind_rows(
+  read_csv("data/units_haematology.csv") %>% gather(key, unit),
+  read_csv("data/units_chemistry.csv") %>% gather(key, unit))
+
+clin.comp.units <- test %>%
+  left_join(units_clinical, by = "key") %>%
+  mutate(unit = replace(unit, key %in% binary.names, "%"),
+         unit = replace(unit, str_detect(key, "^BP "), "mmHg"),
+         unit = replace(unit, key == "BMI", "kg/m^2"),
+         unit = replace(unit, key == "Weight", "kg"),
+         unit = replace(unit, key == "Heart rate", "bpm"),
+         unit = replace(unit, key %in% c("Height", "Waist circumference"), "cm"))
+
+options(xtable.comment = FALSE, xtable.booktabs = TRUE)
+
+# The following ordering was sent by Arnold (11.1.19). Hoewever, it excludes
+# "BMI (kg/m^2)", "Creatinine (micromol/L)", "Height (cm)", "Kidney disease (%)",
+# "Lp(a) (g/L)", "MCH (pg)", "MCHC (g/L)", "MCV (fl)", "RDW (%)", "Weight (kg)".
+ordering.Arnold <- c("Female (%)", "Age (years)", "BMI (kg/m^2)",
+                     "Waist circumference (cm)", "Smoker (%)",
+                     "Daily alcohol consumption (%)", "Hypertension (%)",
+                     "BP diastolic (mmHg)", "BP systolic (mmHg)",
+                     "Heart rate (bpm)", "Hb (g/L)", "HK (L/L)",
+                     "Erythrocytes (T/l)", "Leukocytes (G/l)",
+                     "Thrombocytes (G/L)", "CRP (mg/L)", "ALT (U/L)",
+                     "AST (U/L)", "GGT (U/L)", "eGFR (ml/min)",
+                     "Glucose (mmol/L)", "HbA1c IFCC (nmol/mol)",
+                     "Cholesterol (mmol/L)", "Triglycerides (mmol/L)",
+                     "HDL-C (mmol/L)", "LDL-C (mmol/L)", "non-HDL-C (mmol/L)",
+                     "ApoA-I (g/L)", "ApoB (g/L)")
+
+clin.comp.units %>%
+  mutate(key = paste0(key, " (", unit, ")"),
+         key = factor(key, levels = ordering.Arnold)) %>%
+  # Exclude varibles not present in Arnold's ordering.
+  filter(!is.na(key)) %>%
+  arrange(-desc(key)) %>%
+  select(-unit) %>%
+  xtable::xtable(caption = "Summary of clinical data patients and healthy
+volunteers. Average measurements are shown, with standard deviations in parenthesis. For dichotomous variables (e.g.~hypertension), prevalences are shown as percentages.") %>%
+  print(include.rownames = FALSE)
+
+clin.comp.cond %>%
+  select(`Proband ID`, condition) %>%
+  distinct() %>%
+  group_by(condition) %>%
+  summarise(n = n())
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

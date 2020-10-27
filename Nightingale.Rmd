@@ -1,0 +1,104 @@
+---
+title: "NMR spectroscopy normalisation"
+author: "Mathias Cardner"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(ggrepel)
+nightingale.tidy <- readRDS("computations/nightingale.tidy.rds")
+metadata <- readRDS("computations/nightingale.metadata.rds")
+covariates <- readRDS("computations/covariates.rds")
+```
+
+Features have different LLOQs; especially those based on concentration. If we add a global LLOQ, this would make each feature bimodal. Instead, we estimate the LLOQ per feature (if any observation is 0).
+
+```{r}
+source("helper_normalisation.R")
+source("helper_volcanoes.R")
+night.aug <- nightingale.tidy %>%
+  left_join(metadata %>%
+              filter(metatype == "abbreviation") %>%
+              select(key, value) %>%
+              rename(abbreviation = value),
+            by = "key") %>%
+  rename(`full form` = key,
+         key = abbreviation) %>%
+  filter(`Proband ID` %in% covariates$`Proband ID`) %>%
+  log_and_add_covariates(join.by = "Proband ID")
+night.nested.lm.fits <- nested_lm_fits(night.aug, isolated = FALSE)
+night.lm.brooms <- lm_brooms(night.nested.lm.fits)
+night.lm.brooms.adjusted <- lm_brooms_adjusted(night.lm.brooms)
+night.lm.brooms.normalised <- lm_brooms_normalise(night.lm.brooms) %>%
+  # Explicitly ungroup, to address a recent change to dplyr.
+  ungroup() %>%
+  mutate(`data source` = "lipoprotein profiling")
+saveRDS(night.lm.brooms.normalised, "computations/nightingale.normalised.fin.rds")
+
+night.volcano <- night.lm.brooms.adjusted %>%
+  plot_volcano(titl = "NMR spectroscopy", isolated = FALSE)
+ggsave("plots/Suppl_Fig_1_volcano_NMR_abbreviated.pdf",
+       plot = night.volcano, width = 7, height = 9)
+```
+
+```{r include=FALSE}
+sink("/Users/cardnerm/Documents/LaTeX/msb/print_NMR_volcano.txt")
+night.lm.brooms.adjusted %>% print_significant_omics()
+sink()
+```
+
+```{r eval=FALSE, include=FALSE}
+for(i in 1:nrow(night.lm.brooms)) {
+  pdf(paste0("plots/lm_diagnostics/", gsub("/", "-", night.lm.brooms$key[i]), ".pdf"),
+      width = 10, height = 10)
+  par(mfrow = c(2,2))
+  plot(night.lm.brooms$linMod[[i]])
+  dev.off()
+}
+```
+
+# PCA for HDL-X samples with covariates from dictionary
+
+```{r}
+dictionary <- readRDS("computations/dictionary.rds")
+nightingale.spread <- #nightingale.normalised %>%
+  nightingale.tidy %>%
+  filter(`Proband ID` %in% dictionary$`Proband ID`) %>%
+  mutate(value = ifelse(is.na(value), 0, value)) %>%
+  select(`Proband ID`, key, value) %>%
+  spread(key, value) %>%
+  column_to_rownames("Proband ID")
+pca.nightingale <- prcomp(nightingale.spread, scale. = T)
+pca.nightingale.var <- pca.nightingale$sdev^2/(sum(pca.nightingale$sdev^2))*100
+
+pca.nightingale$x %>%
+  as.data.frame() %>%
+  rownames_to_column("Proband ID") %>%
+  as_tibble() %>%
+  left_join(covariates, by = "Proband ID") %>%
+  ggplot(aes(x = PC1, y = PC2, shape = hospital, colour = Female)) +
+  theme_bw() +
+  # guides(col = guide_legend(ncol = 2)) +
+  labs(title = "Principal component analysis of NMR data",
+       # subtitle = expression(log[2](value + LLOQ/sqrt(2))),
+       x = paste0("PC1 (", round(pca.nightingale.var[1]), "% variance)"),
+       y = paste0("PC2 (", round(pca.nightingale.var[2]), "% variance)")) +
+  # geom_text(aes(label = `Proband ID`))
+  geom_point() +
+  scale_size_discrete(range = c(1, 2)) +
+  scale_alpha_discrete(range = c(0.25, 1))
+ggsave("plots/pca_NMR_with_outliers.pdf", width = 6, height = 4)
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

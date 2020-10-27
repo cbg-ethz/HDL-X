@@ -1,6 +1,6 @@
 # HDL-X
 
-This repository contains all R Markdown files used in the data analysis presented in [Cardner *et al.* (2020)](https://insight.jci.org/articles/view/131491), [doi: 10.1172/jci.insight.131491](https://doi.org/10.1172/jci.insight.131491).
+This repository contains all R Markdown files used for the data analysis presented in [Cardner *et al.* (2020)](https://insight.jci.org/articles/view/131491), [doi: 10.1172/jci.insight.131491](https://doi.org/10.1172/jci.insight.131491).
 
 ## Main document structure
 
