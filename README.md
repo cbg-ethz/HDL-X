@@ -22,4 +22,4 @@ For reasons of data privacy, this repository contains no actual data, but merely
 
 ## Additional analyses
 
-In addition to the main documents, there are auxiliary R Markdown files for various purposes. Importantly, the `JointGGM.Rmd` explores the joint graphical lasso. The corresponding setup for running it on Euler are available in the `FGL` directory (not committed).
+In addition to the main documents, there are auxiliary R Markdown files for various purposes. Importantly, the `JointGGM.Rmd` explores the joint graphical lasso.
